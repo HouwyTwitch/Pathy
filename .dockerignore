@@ -1,0 +1,9 @@
+.git
+node_modules
+scripts
+docs
+*.md
+.env
+*state*.json
+Dockerfile
+docker-compose.yml

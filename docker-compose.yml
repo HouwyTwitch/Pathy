@@ -1,0 +1,62 @@
+# Pathy — post-quantum E2E messenger.
+#
+#   cp .env.example .env    # then set POSTGRES_PASSWORD
+#   docker compose up -d --build
+#   open http://localhost:8080
+#
+# Optional echo bot (create a bot in the web UI first, put its token in .env):
+#   docker compose --profile bots up -d --build
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: pathy
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: pathy
+    volumes:
+      - pathy-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pathy -d pathy"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    # The database is intentionally not exposed on the host; it stores only
+    # ciphertext, public keys and hashed credentials anyway.
+
+  server:
+    build: .
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://pathy:${POSTGRES_PASSWORD}@db:5432/pathy
+      PORT: "8080"
+      # Set when running behind a TLS-terminating reverse proxy so client IPs
+      # are taken from X-Forwarded-For (affects rate limiting only):
+      # TRUST_PROXY: "1"
+    ports:
+      - "${PATHY_PORT:-8080}:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Example E2E bot. Requires PATHY_BOT_TOKEN in .env (create the bot in the
+  # web UI: 🤖 → Create a bot). Enabled with --profile bots.
+  echo-bot:
+    build: .
+    profiles: ["bots"]
+    restart: unless-stopped
+    command: ["node", "bots/echo-bot/bot.js"]
+    environment:
+      PATHY_BOT_TOKEN: ${PATHY_BOT_TOKEN:-}
+      PATHY_BASE_URL: http://server:8080
+      PATHY_BOT_STATE: /data/echo-bot-state.json
+    volumes:
+      - bot-state:/data
+    depends_on:
+      server:
+        condition: service_healthy
+
+volumes:
+  pathy-db:
+  bot-state:

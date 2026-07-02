@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="color-scheme" content="dark light">
+  <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#12161d">
+  <meta name="theme-color" media="(prefers-color-scheme: light)" content="#ffffff">
+  <meta name="description" content="Pathy — post-quantum end-to-end encrypted messenger">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Pathy">
+  <title>Pathy — post-quantum E2E messenger</title>
+  <link rel="stylesheet" href="/css/app.css">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/icon.svg">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <script type="importmap">
+{
+  "imports": {
+    "@noble/post-quantum/": "/vendor/@noble/post-quantum/",
+    "@noble/hashes/": "/vendor/@noble/hashes/",
+    "@noble/ciphers/": "/vendor/@noble/ciphers/",
+    "@noble/curves/": "/vendor/@noble/curves/"
+  }
+}
+  </script>
+  <script type="module" src="/js/app.js"></script>
+</head>
+<body>
+  <div id="app">
+    <noscript>Pathy needs JavaScript — all encryption happens in your browser.</noscript>
+  </div>
+</body>
+</html>

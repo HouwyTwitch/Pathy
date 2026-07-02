@@ -1,0 +1,26 @@
+{
+  "name": "pathy",
+  "version": "0.1.0",
+  "description": "Pathy — post-quantum end-to-end encrypted messenger with channels and a bot API",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node server/src/index.js",
+    "test:crypto": "node scripts/crypto-test.mjs",
+    "smoke": "node scripts/smoke-test.mjs",
+    "bot:echo": "node bots/echo-bot/bot.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@noble/ciphers": "^2.0.1",
+    "@noble/curves": "^2.0.1",
+    "@noble/hashes": "^2.0.1",
+    "@noble/post-quantum": "^0.6.1",
+    "express": "^4.21.2",
+    "pg": "^8.13.1",
+    "web-push": "^3.6.7",
+    "ws": "^8.18.0"
+  }
+}
