@@ -37,6 +37,11 @@ async function newUser(name, contextOpts = {}) {
   return { ctx, page, username: `${name}_${run}` };
 }
 
+const png1x1 = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+  'base64',
+);
+
 const walt = await newUser('walt');
 log('walt registered in browser (scrypt + PQC keygen ran client-side)');
 
@@ -62,6 +67,16 @@ assert.equal(
   1, 'own message must appear exactly once after the WS echo lands',
 );
 log('own message rendered exactly once (no optimistic/WS duplicate)');
+
+// channel photo: admin sets it through the crop dialog
+await walt.page.getByRole('button', { name: 'info' }).click();
+await walt.page.locator('.modal .hidden-file').setInputFiles({
+  name: 'room.png', mimeType: 'image/png', buffer: png1x1,
+});
+await walt.page.locator('.crop-canvas').waitFor({ timeout: 10000 });
+await walt.page.getByRole('button', { name: 'Save' }).click();
+await walt.page.locator('.chat-header .avatar-img').waitFor({ timeout: 15000 });
+log('channel photo: cropped, uploaded, shown in the header (room avatars)');
 
 // second user finds walt by *typing* into search (regression: typing used to
 // be wiped by re-renders; only pasting worked)
@@ -101,6 +116,17 @@ log('walt received + decrypted the DM in realtime (WS push)');
 await wendy.page.locator('.msg.out .tick.read').first().waitFor({ timeout: 15000 });
 log('read receipt: tick became a double check once walt opened the chat');
 
+// user profile: click the chat header to view the peer's profile
+await walt.page.locator('.chat-head-text').click();
+await walt.page.locator('.profile-view').waitFor({ timeout: 15000 });
+assert.match(
+  await walt.page.locator('.modal').textContent(), new RegExp(`wendy_${run}`),
+  'profile shows the username',
+);
+assert.ok(await walt.page.locator('.modal .fp').count() >= 1, 'profile shows the fingerprint');
+await walt.page.locator('.modal .actions button.ghost').click();
+log('user profile opens from the chat header (avatar, status, fingerprint)');
+
 // edit a message: sender re-encrypts, both sides update, "edited" label shows
 await wendy.page.locator('.msg.out .bubble', { hasText: 'hi walt' }).click({ button: 'right' });
 await wendy.page.locator('.action-item', { hasText: 'Edit' }).click();
@@ -122,7 +148,8 @@ await wendy.page.locator('.msg.out .bubble', { hasText: 'will be deleted' }).cli
 await wendy.page.locator('.action-item', { hasText: 'Delete for everyone' }).click();
 await walt.page.locator('.msg .bubble', { hasText: 'will be deleted' })
   .waitFor({ state: 'detached', timeout: 15000 });
-assert.equal(await wendy.page.locator('.msg .bubble', { hasText: 'will be deleted' }).count(), 0);
+await wendy.page.locator('.msg .bubble', { hasText: 'will be deleted' })
+  .waitFor({ state: 'detached', timeout: 15000 });
 log('message delete: removed for both sides (ciphertext destroyed server-side)');
 
 // emoji picker inserts into the composer
@@ -173,10 +200,6 @@ assert.match(await link.getAttribute('rel'), /noopener/);
 log('URLs render as clickable, noopener links');
 
 // encrypted image attachment: wendy sends, both sides decrypt + preview
-const png1x1 = Buffer.from(
-  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
-  'base64',
-);
 await wendy.page.locator('.composer .hidden-file').setInputFiles({
   name: 'pixel.png', mimeType: 'image/png', buffer: png1x1,
 });
@@ -221,6 +244,36 @@ assert.ok(scrollAfter < 120, `scroll stays anchored while reading history (got $
 await walt.page.locator('.messages').evaluate((el) => { el.scrollTop = el.scrollHeight; });
 log('incoming messages no longer jump the chat when scrolled up');
 
+// image viewer scales the picture to the screen instead of natural size
+await walt.page.locator('.msg .img-attach').first().click();
+await walt.page.locator('.modal-back.viewer img').waitFor({ timeout: 10000 });
+const viewerBox = await walt.page.locator('.modal-back.viewer img').boundingBox();
+const viewport = walt.page.viewportSize();
+assert.ok(viewerBox.width <= viewport.width && viewerBox.height <= viewport.height,
+  'viewer image fits inside the window');
+await walt.page.locator('.modal-back.viewer').click();
+await walt.page.locator('.modal-back.viewer').waitFor({ state: 'detached', timeout: 5000 });
+log('image viewer fits the picture to the screen');
+
+// multi-select: pick several messages, copy, then delete them together
+await wendy.page.locator('.msg.out .bubble', { hasText: 'filler message 4' }).click({ button: 'right' });
+await wendy.page.locator('.action-item', { hasText: 'Select' }).click();
+await wendy.page.locator('.select-bar', { hasText: '1 selected' }).waitFor({ timeout: 10000 });
+await wendy.page.locator('.msg', { hasText: 'filler message 3' }).click();
+await wendy.page.locator('.select-bar', { hasText: '2 selected' }).waitFor({ timeout: 10000 });
+await wendy.page.locator('button[title="Copy selected"]').click();
+await wendy.page.locator('.select-bar').waitFor({ state: 'detached', timeout: 10000 });
+await wendy.page.locator('.msg.out .bubble', { hasText: 'filler message 4' }).click({ button: 'right' });
+await wendy.page.locator('.action-item', { hasText: 'Select' }).click();
+await wendy.page.locator('.msg', { hasText: 'filler message 3' }).click();
+await wendy.page.locator('.select-bar', { hasText: '2 selected' }).waitFor({ timeout: 10000 });
+await wendy.page.locator('button[title="Delete selected"]').click();
+await walt.page.locator('.msg .bubble', { hasText: 'filler message 4' })
+  .waitFor({ state: 'detached', timeout: 15000 });
+await walt.page.locator('.msg .bubble', { hasText: 'filler message 3' })
+  .waitFor({ state: 'detached', timeout: 15000 });
+log('multi-select: copy and bulk delete work like Telegram');
+
 // no unverified badge should be shown
 assert.equal(await walt.page.locator('.unverified').count(), 0, 'signatures verified');
 
@@ -232,11 +285,13 @@ assert.match(fp.trim(), /^([0-9a-f]{4} ){7}[0-9a-f]{4}$/, 'fingerprint format');
 await walt.page.getByRole('button', { name: 'Done' }).click();
 log('identity verification modal shows matching-format fingerprints');
 
-// avatar: set from settings, shows in the sidebar, then remove
+// avatar: pick a photo, adjust it in the crop dialog, shows in the sidebar
 await walt.page.locator('button[title="Settings"]').click();
 await walt.page.locator('.view .hidden-file').setInputFiles({
   name: 'me.png', mimeType: 'image/png', buffer: png1x1, // known-good png
 });
+await walt.page.locator('.crop-canvas').waitFor({ timeout: 10000 });
+await walt.page.getByRole('button', { name: 'Save' }).click();
 await walt.page.locator('.sidebar-bottom .avatar-img').waitFor({ timeout: 15000 });
 await walt.page.getByRole('button', { name: 'Remove' }).click();
 await walt.page.locator('.sidebar-bottom .avatar-img').waitFor({ state: 'detached', timeout: 15000 });

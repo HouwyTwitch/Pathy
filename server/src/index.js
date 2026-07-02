@@ -60,7 +60,18 @@ app.use('/botapi/:token', botapi);
 // Browser code: the SPA, the shared E2E crypto core, and the audited @noble
 // modules straight from node_modules (JS only), wired up via an import map
 // in index.html — no bundler involved.
-const staticOpts = { index: false, maxAge: '1h', fallthrough: true };
+// HTML and the service worker must revalidate so installed apps pick up UI
+// updates promptly; hashed-free assets keep a short cache.
+const staticOpts = {
+  index: false,
+  maxAge: '1h',
+  fallthrough: true,
+  setHeaders: (res, filePath) => {
+    if (filePath.endsWith('.html') || filePath.endsWith('sw.js')) {
+      res.setHeader('Cache-Control', 'no-cache');
+    }
+  },
+};
 app.use('/shared', express.static(path.join(repoRoot, 'shared'), staticOpts));
 app.use('/vendor/@noble', (req, res, next) => {
   if (!req.path.endsWith('.js')) return res.status(404).end();

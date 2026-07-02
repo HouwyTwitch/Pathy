@@ -118,6 +118,10 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_mime TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_rev  INT NOT NULL DEFAULT 0;
 -- Per-user pinned-chat ordering (NULL = not pinned; ascending = top first).
 ALTER TABLE members ADD COLUMN IF NOT EXISTS pin_order DOUBLE PRECISION;
+-- Group/channel avatars (managed by admins; visible to members).
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS avatar      BYTEA;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS avatar_mime TEXT;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS avatar_rev  INT NOT NULL DEFAULT 0;
 
 -- Web Push: server VAPID keypair (generated once) + per-device subscriptions.
 -- Pushes carry only metadata the server already knows (conv id, sender ref) —

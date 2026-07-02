@@ -108,7 +108,10 @@ export async function getBundle(ref, { refresh = false } = {}) {
   if (!refresh && state.bundles.has(ref)) return state.bundles.get(ref);
   const res = await api.bundle(ref);
   const keys = C.verifyPublicBundle(res.bundle, ref);
-  const entry = { username: res.username, kind: res.kind, keys, bundle: res.bundle, online: res.online };
+  const entry = {
+    username: res.username, kind: res.kind, keys, bundle: res.bundle,
+    online: res.online, avatarRev: res.avatarRev || 0,
+  };
   state.bundles.set(ref, entry);
   return entry;
 }

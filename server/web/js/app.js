@@ -15,6 +15,7 @@ const ui = {
   drafts: new Map(),      // convId -> composer draft
   editing: null,          // { convId, id, prevDraft }
   picker: null,           // null | 'emoji' | 'stickers'
+  select: null,           // Set of selected message ids (active conv only)
   searchQuery: '',
   searchResults: null,
   modal: null,
@@ -218,16 +219,14 @@ async function syncPushSubscription(enable) {
 
 // ---------------------------------------------------------------- avatars
 
-const avatarCache = new Map(); // `${ref}:${rev}` -> { url } | { loading } | { missing }
+const avatarCache = new Map(); // cache key -> { url } | { loading } | { missing }
 
-function avatarUrl(ref, rev) {
-  if (!ref || !rev) return null;
-  const key = `${ref}:${rev}`;
+function cachedImage(key, fetcher) {
   let e = avatarCache.get(key);
   if (!e) {
     e = { loading: true };
     avatarCache.set(key, e);
-    api.fetchAvatar(ref, rev).then((blob) => {
+    fetcher().then((blob) => {
       e.url = URL.createObjectURL(blob);
       e.loading = false;
       renderMain();
@@ -236,11 +235,16 @@ function avatarUrl(ref, rev) {
   return e.url || null;
 }
 
-// av: { ref, rev } for principals that may have a profile picture.
+// av: { ref, rev } for users/bots, { conv, rev } for room photos.
 function avatarFor(name, kind = 'user', online = false, av = null) {
   const hue = [...name].reduce((a, c) => a + c.charCodeAt(0) * 7, 0) % 8;
-  const url = av ? avatarUrl(av.ref, av.rev) : null;
-  const glyph = url ? h('img', { class: 'avatar-img', src: url, alt: '' })
+  let url = null;
+  if (av?.rev) {
+    url = av.conv != null
+      ? cachedImage(`conv:${av.conv}:${av.rev}`, () => api.fetchConvAvatar(av.conv, av.rev))
+      : cachedImage(`${av.ref}:${av.rev}`, () => api.fetchAvatar(av.ref, av.rev));
+  }
+  const glyph = url ? h('img', { class: 'avatar-img', src: url, alt: '', draggable: 'false' })
     : kind === 'bot' ? icon('bot', 'av-icon')
       : kind === 'channel' ? icon('radio', 'av-icon')
         : kind === 'group' ? icon('users', 'av-icon')
@@ -253,6 +257,14 @@ function avatarFor(name, kind = 'user', online = false, av = null) {
 function memberAv(conv, ref) {
   const m = conv?.members?.find((x) => x.ref === ref);
   return m && m.avatarRev ? { ref, rev: m.avatarRev } : null;
+}
+
+// The avatar shown for a conversation row/header: peer photo for DMs, the
+// room photo for groups & channels.
+function convAv(conv) {
+  const peer = dmPeer(conv);
+  if (peer) return memberAv(conv, peer);
+  return conv.avatarRev ? { conv: conv.id, rev: conv.avatarRev } : null;
 }
 
 const fmtTime = (ts) => new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -344,8 +356,23 @@ function upsertMessage(convId, msg) {
   const id = msg.id != null ? String(msg.id) : null;
   const existing = list.find((m) =>
     (id && m.id != null && String(m.id) === id) || (msg.localId && m.localId === msg.localId));
-  if (existing) Object.assign(existing, msg);
-  else list.push(msg);
+  if (existing) {
+    Object.assign(existing, msg);
+    return list;
+  }
+  // The WS echo of an own message can land before the HTTP send response —
+  // merge it into the optimistic copy instead of flashing a duplicate.
+  if (id && !msg.localId && msg.senderRef === state.me?.ref) {
+    const echo = list.find((m) => m.pending && m.id == null && m.senderRef === msg.senderRef
+      && m.body?.t === msg.body?.t
+      && (m.body?.t !== 'text' || m.body.text === msg.body?.text)
+      && (m.body?.t !== 'sticker' || m.body.emoji === msg.body?.emoji));
+    if (echo) {
+      Object.assign(echo, msg, { pending: false, uploading: undefined });
+      return list;
+    }
+  }
+  list.push(msg);
   return list;
 }
 
@@ -673,7 +700,7 @@ function renderSearchOrChats() {
         oncontextmenu: (e) => { e.preventDefault(); openChatActions(conv); },
         ...(pinned ? { draggable: 'true' } : {}),
       },
-      avatarFor(convTitle(conv), avatarKind(conv), online, peer ? memberAv(conv, peer) : null),
+      avatarFor(convTitle(conv), avatarKind(conv), online, convAv(conv)),
       h('div', { class: 'chat-body' },
         h('div', { class: 'chat-row' },
           h('div', { class: 'chat-name' }, convTitle(conv)),
@@ -736,6 +763,7 @@ async function openConv(id) {
   ui.activeConvId = id;
   ui.unread.delete(id);
   ui.picker = null;
+  ui.select = null;
   clearNotifications(id);
   renderMain();
   const conv = findConv(id);
@@ -801,7 +829,7 @@ function openImageViewer(url, name) {
   ui.modal = h('div', {
     class: 'modal-back viewer',
     onclick: () => closeModal(),
-  }, h('img', { src: url, alt: name || 'image' }));
+  }, h('img', { src: url, alt: name || 'image', draggable: 'false' }));
   renderMain();
 }
 
@@ -1024,8 +1052,8 @@ function fileBubbleContent(m) {
       return ph;
     }
     const img = h('img', {
-      class: 'img-attach', src: entry.url, alt: b.name,
-      onclick: () => openImageViewer(entry.url, b.name),
+      class: 'img-attach', src: entry.url, alt: b.name, draggable: 'false',
+      onclick: () => { if (!ui.select) openImageViewer(entry.url, b.name); },
     });
     if (b.w && b.h) img.style.aspectRatio = `${b.w} / ${b.h}`; // reserve space, no layout jump
     return img;
@@ -1043,11 +1071,62 @@ function fileBubbleContent(m) {
 
 // ---- message actions (edit / delete / copy)
 
+// ---- multi-select (like Telegram: pick messages, then copy/delete)
+
+function canDeleteMsg(conv, m) {
+  return m.senderRef === state.me.ref || (conv.myRole === 'admin' && conv.type !== 'dm');
+}
+
+function toggleSelect(m) {
+  if (!ui.select || m.id == null) return;
+  const k = String(m.id);
+  if (ui.select.has(k)) ui.select.delete(k);
+  else ui.select.add(k);
+  if (ui.select.size === 0) ui.select = null;
+  renderMain();
+}
+
+function selectedMsgs(conv) {
+  return (ui.msgs.get(conv.id) || [])
+    .filter((m) => m.id != null && ui.select?.has(String(m.id)))
+    .sort((a, b) => new Date(a.ts) - new Date(b.ts));
+}
+
+function copySelected(conv) {
+  const parts = selectedMsgs(conv).map((m) => {
+    if (m.error) return null;
+    const b = m.body || {};
+    if (b.t === 'sticker') return b.emoji;
+    if (b.t === 'file') return b.kind === 'voice' ? '[voice message]' : `[${b.name || 'file'}]`;
+    return b.text;
+  }).filter(Boolean);
+  ui.select = null;
+  renderMain();
+  if (parts.length === 0) return;
+  navigator.clipboard?.writeText(parts.join('\n')).then(() => toast('copied')).catch(() => {});
+}
+
+async function deleteSelected(conv) {
+  const msgs = selectedMsgs(conv);
+  if (msgs.length === 0 || !msgs.every((m) => canDeleteMsg(conv, m))) return;
+  if (!confirm(`Delete ${msgs.length} message${msgs.length > 1 ? 's' : ''} for everyone?`)) return;
+  ui.select = null;
+  for (const m of msgs) {
+    try {
+      await api.deleteMessage(conv.id, m.id);
+      const list = convMsgs(conv.id);
+      const i = list.findIndex((x) => String(x.id) === String(m.id));
+      if (i >= 0) list.splice(i, 1);
+    } catch (e) { toast(errMsg(e), true); }
+  }
+  renderMain();
+}
+
 function openMsgActions(conv, m) {
-  if (ui.modal || m.id == null || m.pending) return;
+  if (ui.modal || ui.select || m.id == null || m.pending) return;
   const mine = m.senderRef === state.me.ref;
   const canEdit = mine && !m.error && m.body?.t === 'text';
-  const canDelete = mine || (conv.myRole === 'admin' && conv.type !== 'dm');
+  const canDelete = canDeleteMsg(conv, m);
   const items = [];
   const item = (ic, label, fn, cls = '') =>
     h('button', { class: `action-item ghost ${cls}`, onclick: () => { closeModal(); fn(); } }, icon(ic), label);
@@ -1055,6 +1134,10 @@ function openMsgActions(conv, m) {
     items.push(item('copy', 'Copy text', () =>
       navigator.clipboard?.writeText(m.body.text).then(() => toast('copied')).catch(() => {})));
   }
+  items.push(item('check', 'Select', () => {
+    ui.select = new Set([String(m.id)]);
+    renderMain();
+  }));
   if (canEdit) items.push(item('pencil', 'Edit', () => startEdit(conv, m)));
   if (canDelete) {
     items.push(item('trash', 'Delete for everyone', async () => {
@@ -1180,37 +1263,10 @@ async function sendStickerFlow(conv, emoji) {
 
 // ---- messages
 
-function renderChat() {
-  const conv = findConv(ui.activeConvId);
-  if (!conv) return [h('div', { class: 'empty-state' }, 'This chat no longer exists')];
-  const peer = dmPeer(conv);
-  const peerInfo = peer ? state.bundles.get(peer) : null;
-  const canPost = conv.type !== 'channel' || conv.myRole === 'admin';
-
-  const sub = conv.type === 'dm'
-    ? (peer?.startsWith('b:') ? 'bot' : (peerInfo?.online === true ? 'online' : (peerInfo?.online === false ? 'offline' : '')))
-    : `${conv.type} · ${conv.members.length} member${conv.members.length > 1 ? 's' : ''}`;
-
-  const header = h('div', { class: 'chat-header' },
-    h('button', {
-      class: 'icon-btn back-btn', title: 'Back', 'aria-label': 'Back',
-      onclick: () => { ui.activeConvId = null; renderMain(); },
-    }, icon('back')),
-    avatarFor(convTitle(conv), avatarKind(conv), peerInfo?.online === true, peer ? memberAv(conv, peer) : null),
-    h('div', { class: 'chat-head-text', onclick: () => openInfoModal(conv) },
-      h('div', { class: 'title' }, convTitle(conv)),
-      sub ? h('div', { class: `muted${peerInfo?.online === true ? ' online-text' : ''}` }, sub) : null),
-    h('div', { class: 'spacer' }),
-    h('button', {
-      class: 'icon-btn',
-      title: conv.type === 'dm' ? 'verify encryption' : 'conversation info',
-      'aria-label': conv.type === 'dm' ? 'verify' : 'info',
-      onclick: () => openInfoModal(conv),
-    }, icon(conv.type === 'dm' ? 'shield' : 'info')),
-  );
-
+function buildMessagesBox(conv) {
   const msgs = ui.msgs.get(conv.id) || [];
   const otherRead = maxOtherRead(conv);
+  const selecting = ui.select != null;
   const rows = [];
   let lastDay = null;
   for (const m of msgs) {
@@ -1225,6 +1281,7 @@ function renderChat() {
     const isMedia = !m.error && m.body?.t === 'file' && (m.body.mime || '').startsWith('image/')
       && m.body.kind !== 'voice' && !m.uploading && !m.pending;
     const read = mine && !m.pending && m.id != null && Number(m.id) <= otherRead;
+    const selected = selecting && m.id != null && ui.select.has(String(m.id));
 
     const stamp = h('span', { class: 'stamp' },
       !m.error && !m.pending && m.verified === false
@@ -1245,20 +1302,30 @@ function renderChat() {
       class: `bubble${m.error ? ' broken' : ''}${isMedia ? ' media' : ''}${isSticker ? ' sticker-bubble' : ''}${isBigEmoji ? ' big-emoji' : ''}`,
     }, content, stamp);
 
-    const msgEl = h('div', { class: `msg${mine ? ' out' : ''}`, 'data-mid': m.localId || m.id },
-      conv.type !== 'dm' && !mine
-        ? h('div', { class: 'meta' }, h('span', { class: 'sender' }, displayName(m.senderRef)))
-        : null,
-      bubble,
-      m.id != null && !m.pending
-        ? h('button', {
-          class: 'msg-menu icon-btn', title: 'Message actions', 'aria-label': 'Message actions',
-          onclick: (e) => { e.stopPropagation(); openMsgActions(conv, m); },
-        }, icon('more'))
-        : null,
+    const msgEl = h('div', {
+      class: `msg${mine ? ' out' : ''}${selecting ? ' selecting' : ''}${selected ? ' sel' : ''}`,
+      'data-mid': m.localId || m.id,
+    },
+    conv.type !== 'dm' && !mine
+      ? h('div', { class: 'meta' },
+        h('span', { class: 'sender', onclick: () => openProfileModal(m.senderRef) }, displayName(m.senderRef)))
+      : null,
+    bubble,
+    !selecting && m.id != null && !m.pending
+      ? h('button', {
+        class: 'msg-menu icon-btn', title: 'Message actions', 'aria-label': 'Message actions',
+        onclick: (e) => { e.stopPropagation(); openMsgActions(conv, m); },
+      }, icon('more'))
+      : null,
+    selecting && m.id != null
+      ? h('div', { class: 'sel-overlay', onclick: () => toggleSelect(m) },
+        h('span', { class: `sel-dot${selected ? ' on' : ''}` }, selected ? icon('check') : null))
+      : null,
     );
-    bubble.addEventListener('contextmenu', (e) => { e.preventDefault(); openMsgActions(conv, m); });
-    addLongPress(bubble, () => openMsgActions(conv, m));
+    if (!selecting) {
+      bubble.addEventListener('contextmenu', (e) => { e.preventDefault(); openMsgActions(conv, m); });
+      addLongPress(bubble, () => openMsgActions(conv, m));
+    }
     rows.push(msgEl);
   }
 
@@ -1267,6 +1334,70 @@ function renderChat() {
       ? h('div', { class: 'day-sep' }, h('span', {}, 'No messages yet — everything you send is end-to-end encrypted'))
       : null,
     rows);
+  // Nothing inside the chat may start a drag: selected text or an image
+  // being dragged used to hit the (now removed) drop zone and re-send.
+  box.addEventListener('dragstart', (e) => e.preventDefault());
+  return box;
+}
+
+function renderChat() {
+  const conv = findConv(ui.activeConvId);
+  if (!conv) return [h('div', { class: 'empty-state' }, 'This chat no longer exists')];
+  const peer = dmPeer(conv);
+  const peerInfo = peer ? state.bundles.get(peer) : null;
+  const canPost = conv.type !== 'channel' || conv.myRole === 'admin';
+
+  const sub = conv.type === 'dm'
+    ? (peer?.startsWith('b:') ? 'bot' : (peerInfo?.online === true ? 'online' : (peerInfo?.online === false ? 'offline' : '')))
+    : `${conv.type} · ${conv.members.length} member${conv.members.length > 1 ? 's' : ''}`;
+
+  if (ui.select) {
+    const sel = selectedMsgs(conv);
+    const deletable = sel.length > 0 && sel.every((m) => canDeleteMsg(conv, m));
+    const copyBtn = h('button', {
+      class: 'icon-btn', title: 'Copy selected', 'aria-label': 'Copy selected',
+      onclick: () => copySelected(conv),
+    }, icon('copy'));
+    const delBtn = deletable
+      ? h('button', {
+        class: 'icon-btn danger-ic', title: 'Delete selected', 'aria-label': 'Delete selected',
+        onclick: () => deleteSelected(conv),
+      }, icon('trash'))
+      : null;
+    const selectHeader = h('div', { class: 'chat-header select-bar' },
+      h('button', {
+        class: 'icon-btn', title: 'Cancel selection', 'aria-label': 'Cancel selection',
+        onclick: () => { ui.select = null; renderMain(); },
+      }, icon('x')),
+      h('div', { class: 'title' }, `${ui.select.size} selected`),
+      h('div', { class: 'spacer' }),
+      copyBtn, delBtn);
+    return [selectHeader, buildMessagesBox(conv), h('div', { class: 'readonly-note' },
+      'Tap messages to select · copy or delete them together')];
+  }
+
+  const header = h('div', { class: 'chat-header' },
+    h('button', {
+      class: 'icon-btn back-btn', title: 'Back', 'aria-label': 'Back',
+      onclick: () => { ui.activeConvId = null; renderMain(); },
+    }, icon('back')),
+    avatarFor(convTitle(conv), avatarKind(conv), peerInfo?.online === true, convAv(conv)),
+    h('div', {
+      class: 'chat-head-text',
+      onclick: () => (conv.type === 'dm' ? openProfileModal(peer) : openInfoModal(conv)),
+    },
+      h('div', { class: 'title' }, convTitle(conv)),
+      sub ? h('div', { class: `muted${peerInfo?.online === true ? ' online-text' : ''}` }, sub) : null),
+    h('div', { class: 'spacer' }),
+    h('button', {
+      class: 'icon-btn',
+      title: conv.type === 'dm' ? 'verify encryption' : 'conversation info',
+      'aria-label': conv.type === 'dm' ? 'verify' : 'info',
+      onclick: () => openInfoModal(conv),
+    }, icon(conv.type === 'dm' ? 'shield' : 'info')),
+  );
+
+  const box = buildMessagesBox(conv);
 
   let bottom;
   if (rec && rec.conv.id === conv.id) {
@@ -1386,16 +1517,6 @@ function renderChat() {
           onclick: () => fileInput.click(),
         }, icon('paperclip')),
         input, micBtn, sendBtn));
-
-    // drag & drop anywhere over the message area
-    box.addEventListener('dragover', (e) => { e.preventDefault(); box.classList.add('droppable'); });
-    box.addEventListener('dragleave', () => box.classList.remove('droppable'));
-    box.addEventListener('drop', (e) => {
-      e.preventDefault();
-      box.classList.remove('droppable');
-      const files = [...(e.dataTransfer?.files || [])];
-      if (files.length) sendFiles(conv, files);
-    });
   } else {
     bottom = h('div', { class: 'readonly-note' }, icon('radio'), ' Only admins can post in this channel');
   }
@@ -1456,9 +1577,13 @@ function openInfoModal(conv) {
   }
 
   const rows = conv.members.map((m) => h('div', { class: 'member-row' },
+    h('div', {
+      class: 'member-id',
+      onclick: () => openProfileModal(m.ref),
+    },
     avatarFor(m.ref.slice(2), m.ref.startsWith('b:') ? 'bot' : 'user', false,
       m.avatarRev ? { ref: m.ref, rev: m.avatarRev } : null),
-    h('div', { class: 'name' }, displayName(m.ref), ' ', m.role === 'admin' ? h('span', { class: 'badge' }, 'admin') : null),
+    h('div', { class: 'name' }, displayName(m.ref), ' ', m.role === 'admin' ? h('span', { class: 'badge' }, 'admin') : null)),
     h('button', {
       class: 'icon-btn', title: `verify ${displayName(m.ref)}`, 'aria-label': `verify ${displayName(m.ref)}`,
       onclick: async () => {
@@ -1484,7 +1609,44 @@ function openInfoModal(conv) {
       : null,
   ));
 
+  const roomAvInput = h('input', {
+    type: 'file', class: 'hidden-file', accept: 'image/*',
+    onchange: (e) => {
+      const file = e.target.files[0];
+      e.target.value = '';
+      if (!file) return;
+      openCropModal(file, 'Room photo', async (blob) => {
+        try {
+          await api.uploadConvAvatar(conv.id, blob);
+          toast('room photo updated');
+          await refreshConversations();
+        } catch (err) { toast(errMsg(err), true); }
+      });
+    },
+  });
+
   ui.modal = modal(convTitle(conv),
+    h('div', { class: 'profile-view' },
+      h('div', { class: 'avatar-big' }, avatarFor(convTitle(conv), conv.type, false, convAv(conv))),
+      isAdmin
+        ? h('div', { class: 'row wrap-row center-row' },
+          roomAvInput,
+          h('button', { class: 'ghost small', onclick: () => roomAvInput.click() },
+            icon('camera'), conv.avatarRev ? ' Change photo' : ' Set photo'),
+          conv.avatarRev
+            ? h('button', {
+              class: 'danger small',
+              onclick: async () => {
+                try {
+                  await api.deleteConvAvatar(conv.id);
+                  toast('room photo removed');
+                  await refreshConversations();
+                  closeModal();
+                } catch (err) { toast(errMsg(err), true); }
+              },
+            }, 'Remove')
+            : null)
+        : null),
     h('div', { class: 'muted mb10' },
       `${conv.type} · key v${conv.keyVersion}, wrapped per-member with X-Wing (X25519+ML-KEM-768)`),
     ...rows,
@@ -1602,36 +1764,151 @@ async function decodeImage(file) {
   }
 }
 
-// Center-crop + downscale an avatar to 256x256 JPEG in the browser.
-async function resizeAvatar(file) {
-  const im = await decodeImage(file);
-  const size = 256;
-  const scale = Math.max(size / im.w, size / im.h);
-  const w = Math.round(im.w * scale);
-  const hh = Math.round(im.h * scale);
-  const canvas = document.createElement('canvas');
-  canvas.width = size;
-  canvas.height = size;
-  canvas.getContext('2d').drawImage(im.src, (size - w) / 2, (size - hh) / 2, w, hh);
-  im.close();
-  return new Promise((resolve, reject) =>
-    canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('could not encode image'))), 'image/jpeg', 0.85));
+// Interactive crop: drag to position, wheel/slider to zoom, then export a
+// centered 256x256 JPEG.
+async function openCropModal(file, title, onDone) {
+  let im;
+  try {
+    im = await decodeImage(file);
+  } catch (e) { return toast(errMsg(e), true); }
+  const V = Math.min(300, Math.floor(window.innerWidth * 0.78));
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const canvas = h('canvas', { class: 'crop-canvas' });
+  canvas.width = V * dpr;
+  canvas.height = V * dpr;
+  canvas.style.width = `${V}px`;
+  canvas.style.height = `${V}px`;
+  const ctx = canvas.getContext('2d');
+  const k0 = Math.max(V / im.w, V / im.h); // cover
+  let zoom = 1;
+  let offX = (V - im.w * k0) / 2;
+  let offY = (V - im.h * k0) / 2;
+  const draw = () => {
+    const k = k0 * zoom;
+    offX = Math.min(0, Math.max(V - im.w * k, offX));
+    offY = Math.min(0, Math.max(V - im.h * k, offY));
+    ctx.save();
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, V, V);
+    ctx.drawImage(im.src, offX, offY, im.w * k, im.h * k);
+    ctx.restore();
+  };
+  draw();
+
+  let drag = null;
+  canvas.addEventListener('pointerdown', (e) => {
+    drag = { x: e.clientX, y: e.clientY };
+    canvas.setPointerCapture(e.pointerId);
+  });
+  canvas.addEventListener('pointermove', (e) => {
+    if (!drag) return;
+    offX += e.clientX - drag.x;
+    offY += e.clientY - drag.y;
+    drag = { x: e.clientX, y: e.clientY };
+    draw();
+  });
+  canvas.addEventListener('pointerup', () => { drag = null; });
+  canvas.addEventListener('pointercancel', () => { drag = null; });
+
+  const slider = h('input', {
+    type: 'range', min: '1', max: '4', step: '0.01', value: '1', class: 'crop-zoom',
+    'aria-label': 'Zoom',
+    oninput: (e) => zoomTo(Number(e.target.value)),
+  });
+  const zoomTo = (z, cx = V / 2, cy = V / 2) => {
+    const kOld = k0 * zoom;
+    zoom = Math.min(4, Math.max(1, z));
+    const kNew = k0 * zoom;
+    offX = cx - ((cx - offX) / kOld) * kNew;
+    offY = cy - ((cy - offY) / kOld) * kNew;
+    slider.value = String(zoom);
+    draw();
+  };
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const rect = canvas.getBoundingClientRect();
+    zoomTo(zoom * (e.deltaY < 0 ? 1.12 : 0.9), e.clientX - rect.left, e.clientY - rect.top);
+  }, { passive: false });
+
+  ui.modal = modal(title,
+    h('div', { class: 'crop-wrap' }, canvas),
+    h('div', { class: 'crop-controls' }, icon('image'), slider),
+    h('div', { class: 'muted center mb8' }, 'Drag to position · scroll or slide to zoom'),
+    h('div', { class: 'actions' },
+      h('button', { class: 'ghost', onclick: () => { im.close(); closeModal(); } }, 'Cancel'),
+      h('button', {
+        class: 'primary',
+        onclick: () => {
+          const out = document.createElement('canvas');
+          out.width = 256;
+          out.height = 256;
+          const r = 256 / V;
+          const k = k0 * zoom;
+          out.getContext('2d').drawImage(im.src, offX * r, offY * r, im.w * k * r, im.h * k * r);
+          im.close();
+          closeModal();
+          out.toBlob((b) => {
+            if (b) onDone(b);
+            else toast('could not encode image', true);
+          }, 'image/jpeg', 0.85);
+        },
+      }, 'Save')));
+  renderMain();
+}
+
+// ---- user profile
+
+async function openProfileModal(ref) {
+  try {
+    const b = await store.getBundle(ref, { refresh: true });
+    const av = b.avatarRev ? { ref, rev: b.avatarRev } : null;
+    ui.modal = modal(`@${ref.slice(2)}`,
+      h('div', { class: 'profile-view' },
+        h('div', { class: 'avatar-big' }, avatarFor(ref.slice(2), b.kind, false, av)),
+        h('div', { class: 'profile-name' }, displayName(ref)),
+        h('div', { class: `muted${b.online === true ? ' online-text' : ''}` },
+          b.kind === 'bot' ? 'bot' : (b.online === true ? 'online' : (b.online === false ? 'offline' : '')))),
+      b.keys === null
+        ? h('div', { class: 'error-text' }, '⚠ This identity FAILED signature verification. Do not trust it.')
+        : null,
+      h('div', { class: 'field' }, h('label', {}, 'Encryption fingerprint'),
+        h('div', { class: 'fp' }, store.fingerprintOf(ref) || '—')),
+      h('div', { class: 'muted mb8' },
+        'Compare fingerprints over a trusted channel (in person, a call) to verify the end-to-end encryption.'),
+      h('div', { class: 'actions' },
+        ref !== state.me.ref
+          ? h('button', {
+            class: 'primary',
+            onclick: async () => {
+              try {
+                const conv = await store.startDm(ref);
+                await refreshConversations();
+                closeModal();
+                openConv(conv.id);
+              } catch (e) { toast(errMsg(e), true); }
+            },
+          }, icon('send'), ' Message')
+          : null,
+        h('button', { class: 'ghost', onclick: closeModal }, 'Close')));
+    renderMain();
+  } catch (e) { toast(errMsg(e), true); }
 }
 
 function renderProfileCard() {
   const fileInput = h('input', {
     type: 'file', class: 'hidden-file', accept: 'image/*',
-    onchange: async (e) => {
+    onchange: (e) => {
       const file = e.target.files[0];
       e.target.value = '';
       if (!file) return;
-      try {
-        const blob = await resizeAvatar(file);
-        const res = await api.uploadAvatar(blob);
-        state.me.avatarRev = res.avatarRev;
-        toast('avatar updated');
-        refreshConversations();
-      } catch (err) { toast(errMsg(err), true); }
+      openCropModal(file, 'Adjust your avatar', async (blob) => {
+        try {
+          const res = await api.uploadAvatar(blob);
+          state.me.avatarRev = res.avatarRev;
+          toast('avatar updated');
+          refreshConversations();
+        } catch (err) { toast(errMsg(err), true); }
+      });
     },
   });
   return h('div', { class: 'card' },
@@ -1915,6 +2192,12 @@ async function enterApp() {
       const conv = findConv(ui.activeConvId);
       if (conv) { markRead(conv); renderMain(); }
     });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && ui.select && !ui.modal) {
+        ui.select = null;
+        renderMain();
+      }
+    });
   }
   syncPushSubscription(notifyEnabled()); // keep this device's push sub fresh
   await refreshConversations();
@@ -1943,16 +2226,24 @@ if ('serviceWorker' in navigator) {
 if (window.visualViewport) {
   const vv = window.visualViewport;
   const sync = () => {
-    const keyboard = vv.scale === 1 && window.innerHeight - vv.height > 80;
+    const keyboard = vv.scale === 1 && window.innerHeight - vv.height > 60;
     if (keyboard) {
       document.documentElement.style.setProperty('--app-h', `${Math.round(vv.height)}px`);
       window.scrollTo(0, 0);
+      // keep the conversation pinned to the newest message under the keyboard
+      const box = document.querySelector('.messages');
+      if (box && box.scrollTop + box.clientHeight >= box.scrollHeight - 160) {
+        requestAnimationFrame(() => { box.scrollTop = box.scrollHeight; });
+      }
     } else {
       document.documentElement.style.removeProperty('--app-h');
     }
   };
   vv.addEventListener('resize', sync);
   vv.addEventListener('scroll', sync);
+  // some keyboards resize without firing visualViewport events right away
+  window.addEventListener('focusin', () => setTimeout(sync, 300));
+  window.addEventListener('focusout', () => setTimeout(sync, 300));
 }
 
 (async () => {

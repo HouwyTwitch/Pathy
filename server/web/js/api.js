@@ -59,6 +59,9 @@ export const api = {
   uploadAvatar,
   fetchAvatar,
   vapidKey: () => call('GET', '/push/vapid'),
+  deleteConvAvatar: (id) => call('DELETE', `/conversations/${id}/avatar`),
+  uploadConvAvatar: (id, blob) => putBinary(`/api/conversations/${id}/avatar`, blob),
+  fetchConvAvatar: (id, rev) => fetchImage(`/api/conversations/${id}/avatar?v=${rev}`),
   savePushSub: (sub) => call('POST', '/me/push-subscriptions', sub),
   deletePushSub: (endpoint) => call('DELETE', '/me/push-subscriptions', { endpoint }),
   addMember: (id, b) => call('POST', `/conversations/${id}/members`, b),
@@ -106,8 +109,8 @@ async function fetchBlob(blobId) {
   return new Uint8Array(await res.arrayBuffer());
 }
 
-async function uploadAvatar(blob) {
-  const res = await fetch('/api/me/avatar', {
+async function putBinary(url, blob) {
+  const res = await fetch(url, {
     method: 'PUT',
     headers: {
       'content-type': blob.type || 'image/jpeg',
@@ -120,14 +123,22 @@ async function uploadAvatar(blob) {
   return data;
 }
 
-// Avatars are plain profile images behind session auth, so <img src> can't
-// load them directly — fetch with the bearer token and hand back a Blob.
-async function fetchAvatar(ref, rev) {
-  const res = await fetch(`/api/avatars/${encodeURIComponent(ref)}?v=${rev}`, {
+// Avatars are plain images behind session auth, so <img src> can't load
+// them directly — fetch with the bearer token and hand back a Blob.
+async function fetchImage(url) {
+  const res = await fetch(url, {
     headers: token ? { authorization: `Bearer ${token}` } : {},
   });
   if (!res.ok) throw new ApiError(res.status, 'no avatar');
   return res.blob();
+}
+
+function uploadAvatar(blob) {
+  return putBinary('/api/me/avatar', blob);
+}
+
+function fetchAvatar(ref, rev) {
+  return fetchImage(`/api/avatars/${encodeURIComponent(ref)}?v=${rev}`);
 }
 
 // ------------------------------------------------------------- websocket

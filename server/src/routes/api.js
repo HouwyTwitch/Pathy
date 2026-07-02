@@ -32,6 +32,7 @@ function convSummary(c, myRole, members) {
     keyVersion: c.key_version,
     myRole,
     members,
+    avatarRev: c.avatar_rev ?? 0,
   };
 }
 
@@ -414,6 +415,7 @@ api.post('/conversations', asyncRoute(async (req, res) => {
 api.get('/conversations', asyncRoute(async (req, res) => {
   const r = await q(
     `SELECT c.id, c.type, c.name, c.scope, c.key_version, m.role AS my_role, m.pin_order,
+       CASE WHEN c.avatar IS NULL THEN 0 ELSE c.avatar_rev END AS avatar_rev,
        (SELECT json_agg(json_build_object('ref', mm.ref, 'role', mm.role,
           'avatarRev', COALESCE((SELECT CASE WHEN u.avatar IS NULL THEN 0 ELSE u.avatar_rev END
                                  FROM users u WHERE 'u:' || u.username = mm.ref), 0))
@@ -442,7 +444,11 @@ api.get('/conversations', asyncRoute(async (req, res) => {
 
 async function requireMembership(convId, ref) {
   if (!Number.isInteger(convId) || convId < 1) throw new HttpError(400, 'bad conversation id');
-  const conv = await q('SELECT id, type, name, scope, key_version FROM conversations WHERE id = $1', [convId]);
+  const conv = await q(
+    `SELECT id, type, name, scope, key_version,
+            CASE WHEN avatar IS NULL THEN 0 ELSE avatar_rev END AS avatar_rev
+     FROM conversations WHERE id = $1`, [convId],
+  );
   if (!conv.rows[0]) throw new HttpError(404, 'conversation not found');
   const membership = await memberOf(convId, ref);
   if (!membership) throw new HttpError(403, 'not a member');
@@ -724,6 +730,57 @@ api.delete('/conversations/:id', asyncRoute(async (req, res) => {
   await deliverToConversation(convId, { type: 'conv_deleted', convId, by: me });
   await q('DELETE FROM conversations WHERE id = $1', [convId]);
   res.json({ ok: true });
+}));
+
+// Group/channel avatars — admin-managed, visible to members.
+api.put(
+  '/conversations/:id/avatar',
+  rateLimit({ windowMs: 60_000, max: 10, keyFn: (req) => req.user.ref }),
+  raw({ type: 'image/*', limit: 300 * 1024 }),
+  asyncRoute(async (req, res) => {
+    const convId = Number(req.params.id);
+    const { conv, role } = await requireMembership(convId, req.user.ref);
+    if (conv.type === 'dm') throw new HttpError(400, 'dms have no room avatar');
+    if (role !== 'admin') throw new HttpError(403, 'only admins change the room photo');
+    const mime = String(req.headers['content-type'] || '').split(';')[0].trim();
+    if (!AVATAR_MIMES.includes(mime)) throw new HttpError(400, 'avatar must be jpeg, png or webp');
+    if (!Buffer.isBuffer(req.body) || req.body.length < 100) throw new HttpError(400, 'empty image');
+    const r = await q(
+      'UPDATE conversations SET avatar = $1, avatar_mime = $2, avatar_rev = avatar_rev + 1 WHERE id = $3 RETURNING avatar_rev',
+      [req.body, mime, convId],
+    );
+    await deliverToConversation(convId, {
+      type: 'member', action: 'avatar', convId, ref: req.user.ref, by: req.user.ref,
+    });
+    res.json({ ok: true, avatarRev: r.rows[0].avatar_rev });
+  }),
+);
+
+api.delete('/conversations/:id/avatar', asyncRoute(async (req, res) => {
+  const convId = Number(req.params.id);
+  const { conv, role } = await requireMembership(convId, req.user.ref);
+  if (conv.type === 'dm') throw new HttpError(400, 'dms have no room avatar');
+  if (role !== 'admin') throw new HttpError(403, 'only admins change the room photo');
+  await q(
+    'UPDATE conversations SET avatar = NULL, avatar_mime = NULL, avatar_rev = avatar_rev + 1 WHERE id = $1',
+    [convId],
+  );
+  await deliverToConversation(convId, {
+    type: 'member', action: 'avatar', convId, ref: req.user.ref, by: req.user.ref,
+  });
+  res.json({ ok: true, avatarRev: 0 });
+}));
+
+api.get('/conversations/:id/avatar', asyncRoute(async (req, res) => {
+  const convId = Number(req.params.id);
+  await requireMembership(convId, req.user.ref);
+  const r = await q('SELECT avatar, avatar_mime FROM conversations WHERE id = $1', [convId]);
+  if (!r.rows[0]?.avatar) throw new HttpError(404, 'no avatar');
+  res.set({
+    'Content-Type': r.rows[0].avatar_mime || 'image/jpeg',
+    'Cache-Control': 'private, max-age=31536000, immutable', // URL carries ?v=<rev>
+  });
+  res.send(r.rows[0].avatar);
 }));
 
 // Pinned chats: the client sends the full ordered list (top first).
