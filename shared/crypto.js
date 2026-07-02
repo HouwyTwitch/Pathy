@@ -198,6 +198,29 @@ export function unwrapKey(envelope, scope, keyVersion, myRef, myKeys, senderDsaP
   return xchacha20poly1305(wk, nonce, aad).decrypt(wrapped);
 }
 
+// ------------------------------------------------------------- attachments
+
+// Files are encrypted with a random one-off key before upload. The key and
+// nonce travel only inside the E2E-encrypted message body that references
+// the uploaded blob, so the server never learns anything about the file.
+
+export function newBlobKey() {
+  return randomBytes(32);
+}
+
+export function encryptBlob(key, bytes) {
+  const nonce = randomBytes(24);
+  const aad = canon(['pathy-blob-v1']);
+  const ct = xchacha20poly1305(key, nonce, aad).encrypt(bytes);
+  return { n: toB64(nonce), ct };
+}
+
+// Throws if the blob was swapped or corrupted (Poly1305 tag mismatch).
+export function decryptBlob(key, nonceB64, ct) {
+  const aad = canon(['pathy-blob-v1']);
+  return xchacha20poly1305(key, fromB64(nonceB64), aad).decrypt(ct);
+}
+
 // ---------------------------------------------------------------- messages
 
 // Message body is a JSON object (e.g. { t:'text', text:'…' }). AAD binds the

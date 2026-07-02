@@ -1,7 +1,8 @@
 // Telegram-style bot API. Everything content-related is still end-to-end
 // encrypted: the SDK does the crypto with the bot's own keypair, and this
 // API only relays ciphertext, envelopes and public bundles.
-import { Router } from 'express';
+import { Router, raw } from 'express';
+import { randomUUID } from 'node:crypto';
 import { q, memberOf } from '../db.js';
 import { REF_RE, isPublicBundle, isCipherMessage, HttpError, asyncRoute } from '../util.js';
 import { requireBot } from '../auth.js';
@@ -109,6 +110,45 @@ botapi.get('/bundles/:ref', asyncRoute(async (req, res) => {
     : await q('SELECT pub_bundle FROM bots WHERE username = $1', [name]);
   if (!r.rows[0]?.pub_bundle) throw new HttpError(404, 'not found');
   res.json({ ref, username: name, bundle: r.rows[0].pub_bundle });
+}));
+
+// Encrypted attachments — same contract as the user API: the server stores
+// only ciphertext, the per-file key travels inside the E2E message body.
+const MAX_BLOB_SIZE = 64 * 1024 * 1024 + 4096;
+const BLOB_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+botapi.post(
+  '/conversations/:id/blobs',
+  rateLimit({ windowMs: 60_000, max: 30, keyFn: (req) => `bot:${req.bot.id}` }),
+  raw({ type: 'application/octet-stream', limit: MAX_BLOB_SIZE }),
+  asyncRoute(async (req, res) => {
+    const convId = Number(req.params.id);
+    const { conv, role } = await requireBotMembership(convId, req.bot.ref);
+    if (conv.type === 'channel' && role !== 'admin') {
+      throw new HttpError(403, 'only admin bots post in channels');
+    }
+    if (!Buffer.isBuffer(req.body) || req.body.length < 17) {
+      throw new HttpError(400, 'expected an encrypted blob (application/octet-stream)');
+    }
+    const id = randomUUID();
+    await q('INSERT INTO blobs (id, conv_id, uploader_ref, size, data) VALUES ($1, $2, $3, $4, $5)', [
+      id, convId, req.bot.ref, req.body.length, req.body,
+    ]);
+    res.status(201).json({ blobId: id, size: req.body.length });
+  }),
+);
+
+botapi.get('/blobs/:id', asyncRoute(async (req, res) => {
+  const id = String(req.params.id || '');
+  if (!BLOB_ID_RE.test(id)) throw new HttpError(400, 'bad blob id');
+  const r = await q('SELECT conv_id, data FROM blobs WHERE id = $1', [id]);
+  if (!r.rows[0]) throw new HttpError(404, 'blob not found');
+  await requireBotMembership(r.rows[0].conv_id, req.bot.ref);
+  res.set({
+    'Content-Type': 'application/octet-stream',
+    'Cache-Control': 'private, max-age=31536000, immutable',
+  });
+  res.send(r.rows[0].data);
 }));
 
 botapi.post('/sendMessage', asyncRoute(async (req, res) => {

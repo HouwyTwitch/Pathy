@@ -56,7 +56,44 @@ export const api = {
   myBots: () => call('GET', '/bots'),
   createBot: (username) => call('POST', '/bots', { username }),
   deleteBot: (username) => call('DELETE', `/bots/${encodeURIComponent(username)}`),
+  uploadBlob,
+  fetchBlob,
 };
+
+// Upload an already-encrypted blob. XHR instead of fetch so we can report
+// upload progress for large files.
+function uploadBlob(convId, bytes, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `/api/conversations/${convId}/blobs`);
+    xhr.setRequestHeader('content-type', 'application/octet-stream');
+    if (token) xhr.setRequestHeader('authorization', `Bearer ${token}`);
+    xhr.responseType = 'json';
+    if (onProgress) {
+      xhr.upload.addEventListener('progress', (e) => {
+        if (e.lengthComputable) onProgress(e.loaded / e.total);
+      });
+    }
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) resolve(xhr.response);
+      else reject(new ApiError(xhr.status, xhr.response?.error || `http ${xhr.status}`));
+    };
+    xhr.onerror = () => reject(new ApiError(0, 'upload failed — check your connection'));
+    xhr.send(bytes);
+  });
+}
+
+async function fetchBlob(blobId) {
+  const res = await fetch(`/api/blobs/${encodeURIComponent(blobId)}`, {
+    headers: token ? { authorization: `Bearer ${token}` } : {},
+  });
+  if (!res.ok) {
+    let data = null;
+    try { data = await res.json(); } catch { /* not json */ }
+    throw new ApiError(res.status, data?.error || `http ${res.status}`);
+  }
+  return new Uint8Array(await res.arrayBuffer());
+}
 
 // ------------------------------------------------------------- websocket
 

@@ -12,6 +12,12 @@ secret keys never leave the client.
 
 - **Direct messages** — find anyone by username and message them; no friends
   system required.
+- **Encrypted attachments** — send images (inline previews), links, and files
+  up to 64 MB. Files are encrypted client-side with a one-off key that travels
+  only inside the E2E-encrypted message; the server stores pure ciphertext.
+- **Modern, minimal UI** — light & dark themes, and full mobile support:
+  single-pane navigation on phones, safe-area aware, installable (web
+  manifest).
 - **Channels & groups** — Telegram-style: channels are broadcast (only admins
   post), groups let everyone post. Invites wrap the conversation keys to the
   new member's verified public keys; removing a member rotates the key.

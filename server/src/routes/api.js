@@ -1,5 +1,5 @@
-import { Router } from 'express';
-import { randomBytes } from 'node:crypto';
+import { Router, raw } from 'express';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { q, pool, areContacts, memberOf, memberRefs } from '../db.js';
 import {
   sha256, b64uToBuf, newToken, safeEqual, decoySalt,
@@ -531,6 +531,50 @@ api.post('/conversations/:id/messages', messageLimiter, asyncRoute(async (req, r
   };
   await deliverToConversation(convId, { type: 'message', convId, convType: conv.type, message });
   res.status(201).json({ id: message.id, ts: message.ts });
+}));
+
+// ------------------------------------------------------------------ blobs
+
+// Encrypted attachments. Clients encrypt files with a random per-file key
+// before upload; the key travels only inside the E2E-encrypted message that
+// references the blob, so the server stores pure ciphertext.
+const MAX_BLOB_SIZE = 64 * 1024 * 1024 + 4096; // 64 MB plaintext + AEAD overhead
+const BLOB_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+const blobLimiter = rateLimit({ windowMs: 60_000, max: 30, keyFn: (req) => req.user.ref });
+
+api.post(
+  '/conversations/:id/blobs',
+  blobLimiter,
+  raw({ type: 'application/octet-stream', limit: MAX_BLOB_SIZE }),
+  asyncRoute(async (req, res) => {
+    const convId = Number(req.params.id);
+    const { conv, role } = await requireMembership(convId, req.user.ref);
+    if (conv.type === 'channel' && role !== 'admin') {
+      throw new HttpError(403, 'only admins post in channels');
+    }
+    if (!Buffer.isBuffer(req.body) || req.body.length < 17) {
+      throw new HttpError(400, 'expected an encrypted blob (application/octet-stream)');
+    }
+    const id = randomUUID();
+    await q('INSERT INTO blobs (id, conv_id, uploader_ref, size, data) VALUES ($1, $2, $3, $4, $5)', [
+      id, convId, req.user.ref, req.body.length, req.body,
+    ]);
+    res.status(201).json({ blobId: id, size: req.body.length });
+  }),
+);
+
+api.get('/blobs/:id', asyncRoute(async (req, res) => {
+  const id = String(req.params.id || '');
+  if (!BLOB_ID_RE.test(id)) throw new HttpError(400, 'bad blob id');
+  const r = await q('SELECT conv_id, data FROM blobs WHERE id = $1', [id]);
+  if (!r.rows[0]) throw new HttpError(404, 'blob not found');
+  await requireMembership(r.rows[0].conv_id, req.user.ref);
+  res.set({
+    'Content-Type': 'application/octet-stream',
+    'Cache-Control': 'private, max-age=31536000, immutable',
+  });
+  res.send(r.rows[0].data);
 }));
 
 // ------------------------------------------------------------------- bots

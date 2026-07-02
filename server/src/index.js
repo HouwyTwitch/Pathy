@@ -29,8 +29,8 @@ app.use((req, res, next) => {
   // same-origin WebSockets into 'self'.
   res.set({
     'Content-Security-Policy':
-      `default-src 'none'; script-src 'self' ${importMapHash}; style-src 'self'; img-src 'self' data:; `
-      + "connect-src 'self' ws: wss:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+      `default-src 'none'; script-src 'self' ${importMapHash}; style-src 'self'; img-src 'self' data: blob:; `
+      + "connect-src 'self' ws: wss:; manifest-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
     'Referrer-Policy': 'no-referrer',

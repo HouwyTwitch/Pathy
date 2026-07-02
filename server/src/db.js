@@ -78,6 +78,19 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS messages_conv_idx ON messages(conv_id, id DESC);
 
+-- Encrypted attachments. Like messages, the server only ever sees
+-- ciphertext: clients encrypt files with a random per-file key that travels
+-- inside the (E2E-encrypted) message body referencing the blob.
+CREATE TABLE IF NOT EXISTS blobs (
+  id           UUID PRIMARY KEY,
+  conv_id      INT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  uploader_ref TEXT NOT NULL,
+  size         INT NOT NULL,
+  data         BYTEA NOT NULL,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS blobs_conv_idx ON blobs(conv_id);
+
 CREATE TABLE IF NOT EXISTS bot_updates (
   id         BIGSERIAL PRIMARY KEY,
   bot_id     INT NOT NULL REFERENCES bots(id) ON DELETE CASCADE,

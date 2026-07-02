@@ -199,13 +199,11 @@ export async function decryptMessage(conv, msg) {
   }
 }
 
-export async function sendText(conv, text) {
+async function sendBody(conv, body) {
   const doSend = async () => {
     const key = await getConvKey(conv, conv.keyVersion);
     if (!key) throw new Error('no conversation key');
-    const m = C.encryptMessage(key, conv.id, conv.keyVersion, state.me.ref, state.keys, {
-      t: 'text', text, ts: Date.now(),
-    });
+    const m = C.encryptMessage(key, conv.id, conv.keyVersion, state.me.ref, state.keys, body);
     return api.sendMessage(conv.id, m);
   };
   try {
@@ -218,6 +216,48 @@ export async function sendText(conv, text) {
       return doSend();
     }
     throw err;
+  }
+}
+
+export function sendText(conv, text) {
+  return sendBody(conv, { t: 'text', text, ts: Date.now() });
+}
+
+// ----------------------------------------------------------- attachments
+
+export const MAX_FILE_BYTES = 64 * 1024 * 1024;
+
+// Encrypt a File/Blob with a one-off key, upload the ciphertext, then send
+// a message whose (E2E-encrypted) body carries the blob reference + key.
+export async function sendFile(conv, file, onProgress) {
+  if (file.size > MAX_FILE_BYTES) throw new Error('file is too large (max 64 MB)');
+  if (file.size === 0) throw new Error('cannot send an empty file');
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const blobKey = C.newBlobKey();
+  const { n, ct } = C.encryptBlob(blobKey, bytes);
+  const { blobId } = await api.uploadBlob(conv.id, ct, onProgress);
+  const body = {
+    t: 'file',
+    name: String(file.name || 'file').slice(0, 255),
+    size: file.size,
+    mime: String(file.type || 'application/octet-stream').slice(0, 127),
+    blobId,
+    k: C.toB64(blobKey),
+    n,
+    ts: Date.now(),
+  };
+  const sent = await sendBody(conv, body);
+  return { ...sent, body };
+}
+
+// Download + decrypt an attachment referenced by a file message body.
+// Throws if the server returned a different blob than the sender uploaded.
+export async function fetchFile(body) {
+  const ct = await api.fetchBlob(body.blobId);
+  try {
+    return C.decryptBlob(C.fromB64(body.k), body.n, ct);
+  } catch {
+    throw new Error('attachment failed integrity check (tampered or corrupted)');
   }
 }
 
