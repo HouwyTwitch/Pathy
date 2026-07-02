@@ -1,7 +1,9 @@
 // Browser-level test of the web client using Playwright + system Chromium.
 // Covers: import map + CSP, client-side scrypt/keygen, register, channel
 // creation, E2E send/receive between two real browser contexts, no duplicate
-// own messages, char-by-char search typing, encrypted image/file attachments,
+// own messages, char-by-char search typing, read receipts (double ticks),
+// message edit/delete, emoji picker + stickers, voice messages, encrypted
+// image/file attachments, avatars, chat pinning/deletion, scroll anchoring,
 // link rendering, privacy settings UI, and mobile single-pane navigation.
 import { chromium } from 'playwright';
 import assert from 'node:assert/strict';
@@ -12,6 +14,11 @@ const log = (s) => console.log(`✔ ${s}`);
 
 const browser = await chromium.launch({
   executablePath: process.env.PW_CHROMIUM || undefined,
+  args: [
+    '--use-fake-ui-for-media-stream',
+    '--use-fake-device-for-media-stream',
+    '--autoplay-policy=no-user-gesture-required',
+  ],
 });
 
 async function newUser(name, contextOpts = {}) {
@@ -58,7 +65,8 @@ log('own message rendered exactly once (no optimistic/WS duplicate)');
 
 // second user finds walt by *typing* into search (regression: typing used to
 // be wiped by re-renders; only pasting worked)
-const wendy = await newUser('wendy');
+const wendy = await newUser('wendy', { permissions: ['microphone'] });
+wendy.page.on('dialog', (d) => d.accept()); // confirm() for delete actions
 const search = wendy.page.locator('.sidebar-top input');
 await search.click();
 await search.pressSequentially(walt.username.slice(0, 6), { delay: 80 });
@@ -79,12 +87,80 @@ assert.equal(
 );
 log('wendy found walt by typing in search and sent a DM (shown once)');
 
+// read receipts: single tick until walt opens the chat, then double
+await wendy.page.locator('.msg.out .tick:not(.read)').waitFor({ timeout: 15000 });
+assert.equal(await wendy.page.locator('.msg.out .tick.read').count(), 0, 'not read yet');
+
 // walt receives it live over WS and can decrypt
 await walt.page.locator('.chat-item', { hasText: `wendy_${run}` }).waitFor({ timeout: 15000 });
 await walt.page.locator('.chat-item', { hasText: `wendy_${run}` }).click();
 const bubble = walt.page.locator('.msg .bubble', { hasText: 'hi walt' });
 await bubble.waitFor({ timeout: 15000 });
 log('walt received + decrypted the DM in realtime (WS push)');
+
+await wendy.page.locator('.msg.out .tick.read').first().waitFor({ timeout: 15000 });
+log('read receipt: tick became a double check once walt opened the chat');
+
+// edit a message: sender re-encrypts, both sides update, "edited" label shows
+await wendy.page.locator('.msg.out .bubble', { hasText: 'hi walt' }).click({ button: 'right' });
+await wendy.page.locator('.action-item', { hasText: 'Edit' }).click();
+assert.match(
+  await wendy.page.locator('.composer-input').inputValue(), /hi walt/,
+  'composer prefilled with the original text',
+);
+await wendy.page.locator('.composer-input').fill('hi walt — edited from the test');
+await wendy.page.locator('.composer-input').press('Enter');
+await walt.page.locator('.msg .bubble', { hasText: 'edited from the test' }).waitFor({ timeout: 15000 });
+await wendy.page.locator('.msg.out .edited').first().waitFor({ timeout: 15000 });
+log('message edit: re-encrypted, live-updated on both sides, "edited" label shown');
+
+// delete a message for everyone
+await wendy.page.locator('.composer-input').fill('this one will be deleted');
+await wendy.page.locator('.composer-input').press('Enter');
+await walt.page.locator('.msg .bubble', { hasText: 'will be deleted' }).waitFor({ timeout: 15000 });
+await wendy.page.locator('.msg.out .bubble', { hasText: 'will be deleted' }).click({ button: 'right' });
+await wendy.page.locator('.action-item', { hasText: 'Delete for everyone' }).click();
+await walt.page.locator('.msg .bubble', { hasText: 'will be deleted' })
+  .waitFor({ state: 'detached', timeout: 15000 });
+assert.equal(await wendy.page.locator('.msg .bubble', { hasText: 'will be deleted' }).count(), 0);
+log('message delete: removed for both sides (ciphertext destroyed server-side)');
+
+// emoji picker inserts into the composer
+await wendy.page.locator('button[title="Emoji & stickers"]').click();
+await wendy.page.locator('.emoji-cell').first().waitFor({ timeout: 10000 });
+const firstEmoji = (await wendy.page.locator('.emoji-cell').first().textContent()).trim();
+await wendy.page.locator('.emoji-cell').first().click();
+assert.ok(
+  (await wendy.page.locator('.composer-input').inputValue()).includes(firstEmoji),
+  'clicked emoji lands in the composer',
+);
+await wendy.page.locator('.composer-input').press('Enter'); // send it as a message
+await wendy.page.locator('.msg.out .bubble.big-emoji').first().waitFor({ timeout: 15000 });
+log('emoji picker inserts at the caret; emoji-only messages render big');
+
+// stickers: pick from the sticker tab (picker stays open after sending),
+// sent immediately, rendered large
+await wendy.page.locator('.picker-tab', { hasText: 'Stickers' }).click();
+await wendy.page.locator('.sticker-cell').first().click();
+await wendy.page.locator('.msg.out .sticker-emoji').waitFor({ timeout: 15000 });
+await walt.page.locator('.msg .sticker-emoji').waitFor({ timeout: 15000 });
+log('sticker sent from the picker and rendered large on both sides');
+
+// voice message: record from the (fake) microphone, send, receiver plays it
+await wendy.page.locator('.mic-btn').click();
+await wendy.page.locator('.composer.recording').waitFor({ timeout: 10000 });
+await wendy.page.waitForTimeout(1300);
+await wendy.page.locator('.composer.recording .send-btn').click();
+await wendy.page.locator('.msg.out .voice-row').waitFor({ timeout: 30000 });
+const waltVoice = walt.page.locator('.msg .voice-row');
+await waltVoice.waitFor({ timeout: 30000 });
+await waltVoice.locator('.voice-play').click();
+await walt.page.locator('.voice-play[title="Pause"]').waitFor({ timeout: 15000 });
+await walt.page.waitForTimeout(1200);
+const fillWidth = await walt.page.locator('.msg .voice-fill').first()
+  .evaluate((el) => parseFloat(el.style.width) || 0);
+assert.ok(fillWidth > 0, `voice playback progressed (fill ${fillWidth}%)`);
+log('voice message: recorded, encrypted, sent; receiver decrypts and plays it');
 
 // links in messages are rendered as safe anchors
 await wendy.page.locator('.composer-input').fill('docs at https://example.com/pathy?x=1 enjoy');
@@ -129,6 +205,22 @@ const got = await new Promise((resolve, reject) => {
 assert.deepEqual(got, fileBytes, 'downloaded file must decrypt to the original bytes');
 log('binary file: encrypted upload → WS push → download decrypts to identical bytes');
 
+// scroll anchoring: when scrolled up, incoming messages must not yank the view
+for (let i = 0; i < 6; i++) {
+  await wendy.page.locator('.composer-input').fill(`filler message ${i} to make the history scrollable`);
+  await wendy.page.locator('.composer-input').press('Enter');
+}
+await walt.page.locator('.msg .bubble', { hasText: 'filler message 5' }).waitFor({ timeout: 15000 });
+await walt.page.locator('.messages').evaluate((el) => { el.scrollTop = 0; });
+await wendy.page.locator('.composer-input').fill('new message while walt reads history');
+await wendy.page.locator('.composer-input').press('Enter');
+await walt.page.locator('.msg .bubble', { hasText: 'while walt reads history' }).waitFor({ timeout: 15000 });
+await walt.page.waitForTimeout(800);
+const scrollAfter = await walt.page.locator('.messages').evaluate((el) => el.scrollTop);
+assert.ok(scrollAfter < 120, `scroll stays anchored while reading history (got ${scrollAfter})`);
+await walt.page.locator('.messages').evaluate((el) => { el.scrollTop = el.scrollHeight; });
+log('incoming messages no longer jump the chat when scrolled up');
+
 // no unverified badge should be shown
 assert.equal(await walt.page.locator('.unverified').count(), 0, 'signatures verified');
 
@@ -140,8 +232,17 @@ assert.match(fp.trim(), /^([0-9a-f]{4} ){7}[0-9a-f]{4}$/, 'fingerprint format');
 await walt.page.getByRole('button', { name: 'Done' }).click();
 log('identity verification modal shows matching-format fingerprints');
 
-// privacy settings roundtrip
+// avatar: set from settings, shows in the sidebar, then remove
 await walt.page.locator('button[title="Settings"]').click();
+await walt.page.locator('.view .hidden-file').setInputFiles({
+  name: 'me.png', mimeType: 'image/png', buffer: png1x1, // known-good png
+});
+await walt.page.locator('.sidebar-bottom .avatar-img').waitFor({ timeout: 15000 });
+await walt.page.getByRole('button', { name: 'Remove' }).click();
+await walt.page.locator('.sidebar-bottom .avatar-img').waitFor({ state: 'detached', timeout: 15000 });
+log('avatar: uploaded (client-side resized), shown in UI, removed again');
+
+// privacy settings roundtrip (walt is already on the settings page)
 await walt.page.locator('select').first().selectOption('nobody');
 await walt.page.locator('.toast').waitFor({ timeout: 10000 });
 log('privacy setting saved from UI (whoCanDm=nobody)');
@@ -153,6 +254,41 @@ await uma.page.locator('.search-hit').first().waitFor({ timeout: 15000 });
 await uma.page.locator('.search-hit').first().click();
 await uma.page.locator('.toast.err').waitFor({ timeout: 15000 });
 log('whoCanDm=nobody blocks a stranger from the UI with a clear error');
+
+// chat management: pin, reorder pinned, delete a chat
+await wendy.page.locator('button[title="New group / channel"]').click();
+await wendy.page.locator('.modal input').fill(`pins-test-${run}`);
+await wendy.page.getByRole('button', { name: 'Create' }).click();
+await wendy.page.locator('.chat-header').waitFor({ timeout: 15000 });
+
+const wendyItem = (text) => wendy.page.locator('.chat-item', { hasText: text });
+await wendyItem(`pins-test-${run}`).click({ button: 'right' });
+await wendy.page.locator('.action-item', { hasText: 'Pin to top' }).click();
+await wendy.page.locator('.chat-item .pin-mark').first().waitFor({ timeout: 15000 });
+assert.match(
+  await wendy.page.locator('.chat-item').first().textContent(), new RegExp(`pins-test-${run}`),
+  'pinned chat moves to the top',
+);
+await wendyItem(walt.username).click({ button: 'right' });
+await wendy.page.locator('.action-item', { hasText: 'Pin to top' }).click();
+await wendy.page.waitForTimeout(600);
+assert.match(
+  await wendy.page.locator('.chat-item').first().textContent(), new RegExp(walt.username),
+  'newly pinned chat goes above older pins',
+);
+await wendyItem(walt.username).click({ button: 'right' });
+await wendy.page.locator('.action-item', { hasText: 'Move down' }).click();
+await wendy.page.waitForTimeout(600);
+assert.match(
+  await wendy.page.locator('.chat-item').first().textContent(), new RegExp(`pins-test-${run}`),
+  'move down reorders pinned chats',
+);
+log('chats can be pinned to the top and reordered among themselves');
+
+await wendyItem(`pins-test-${run}`).click({ button: 'right' });
+await wendy.page.locator('.action-item', { hasText: 'Delete for everyone' }).click();
+await wendyItem(`pins-test-${run}`).waitFor({ state: 'detached', timeout: 15000 });
+log('chat deleted (conversation removed server-side)');
 
 // mobile: phone-sized viewport gets single-pane navigation with a back button
 const mia = await newUser('mia', {

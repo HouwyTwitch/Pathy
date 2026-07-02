@@ -30,11 +30,12 @@ app.use((req, res, next) => {
   res.set({
     'Content-Security-Policy':
       `default-src 'none'; script-src 'self' ${importMapHash}; style-src 'self'; img-src 'self' data: blob:; `
-      + "connect-src 'self' ws: wss:; manifest-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+      + "media-src 'self' blob:; connect-src 'self' ws: wss:; manifest-src 'self'; "
+      + "base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
     'Referrer-Policy': 'no-referrer',
-    'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+    'Permissions-Policy': 'camera=(), microphone=(self), geolocation=()', // mic: voice messages
     'Cross-Origin-Opener-Policy': 'same-origin',
     'Cross-Origin-Resource-Policy': 'same-origin',
   });

@@ -77,7 +77,10 @@ api.post('/register', authLimiter, asyncRoute(async (req, res) => {
   }
   const token = newToken();
   await q('INSERT INTO sessions (token_hash, user_id) VALUES ($1, $2)', [sha256(b64uToBuf(token)), user.id]);
-  res.status(201).json({ token, me: { ref: `u:${username}`, username, settings: DEFAULT_SETTINGS } });
+  res.status(201).json({
+    token,
+    me: { ref: `u:${username}`, username, settings: DEFAULT_SETTINGS, avatarRev: 0 },
+  });
 }));
 
 // Returns the scrypt salt for a username; a deterministic decoy for unknown
@@ -96,7 +99,11 @@ api.post('/login', authLimiter, asyncRoute(async (req, res) => {
   if (typeof username !== 'string' || !USERNAME_RE.test(username) || !isB64u(authKey, 64)) {
     throw new HttpError(400, 'bad credentials');
   }
-  const r = await q('SELECT id, username, auth_hash, backup, settings FROM users WHERE username = $1', [username]);
+  const r = await q(
+    `SELECT id, username, auth_hash, backup, settings,
+            CASE WHEN avatar IS NULL THEN 0 ELSE avatar_rev END AS avatar_rev
+     FROM users WHERE username = $1`, [username],
+  );
   const row = r.rows[0];
   const presented = sha256(b64uToBuf(authKey));
   if (!row || !safeEqual(presented, row.auth_hash)) throw new HttpError(401, 'invalid credentials');
@@ -105,7 +112,10 @@ api.post('/login', authLimiter, asyncRoute(async (req, res) => {
   res.json({
     token,
     backup: row.backup,
-    me: { ref: `u:${row.username}`, username: row.username, settings: settingsOf(row.settings) },
+    me: {
+      ref: `u:${row.username}`, username: row.username,
+      settings: settingsOf(row.settings), avatarRev: row.avatar_rev || 0,
+    },
   });
 }));
 
@@ -117,9 +127,57 @@ api.post('/logout', asyncRoute(async (req, res) => {
   res.json({ ok: true });
 }));
 
-api.get('/me', (req, res) => {
-  res.json({ ref: req.user.ref, username: req.user.username, settings: settingsOf(req.user.settings) });
-});
+api.get('/me', asyncRoute(async (req, res) => {
+  const r = await q('SELECT CASE WHEN avatar IS NULL THEN 0 ELSE avatar_rev END AS rev FROM users WHERE id = $1', [req.user.id]);
+  res.json({
+    ref: req.user.ref,
+    username: req.user.username,
+    settings: settingsOf(req.user.settings),
+    avatarRev: r.rows[0]?.rev || 0,
+  });
+}));
+
+// ---------------------------------------------------------------- avatars
+
+// Profile pictures are visible to any logged-in user (like usernames);
+// they are not E2E content. Clients downscale before upload.
+const AVATAR_MIMES = ['image/jpeg', 'image/png', 'image/webp'];
+
+api.put(
+  '/me/avatar',
+  rateLimit({ windowMs: 60_000, max: 10, keyFn: (req) => req.user.ref }),
+  raw({ type: 'image/*', limit: 300 * 1024 }),
+  asyncRoute(async (req, res) => {
+    const mime = String(req.headers['content-type'] || '').split(';')[0].trim();
+    if (!AVATAR_MIMES.includes(mime)) throw new HttpError(400, 'avatar must be jpeg, png or webp');
+    if (!Buffer.isBuffer(req.body) || req.body.length < 100) throw new HttpError(400, 'empty image');
+    const r = await q(
+      'UPDATE users SET avatar = $1, avatar_mime = $2, avatar_rev = avatar_rev + 1 WHERE id = $3 RETURNING avatar_rev',
+      [req.body, mime, req.user.id],
+    );
+    res.json({ ok: true, avatarRev: r.rows[0].avatar_rev });
+  }),
+);
+
+api.delete('/me/avatar', asyncRoute(async (req, res) => {
+  await q(
+    'UPDATE users SET avatar = NULL, avatar_mime = NULL, avatar_rev = avatar_rev + 1 WHERE id = $1',
+    [req.user.id],
+  );
+  res.json({ ok: true, avatarRev: 0 });
+}));
+
+api.get('/avatars/:ref', asyncRoute(async (req, res) => {
+  const ref = req.params.ref;
+  if (!REF_RE.test(ref) || !ref.startsWith('u:')) throw new HttpError(404, 'no avatar');
+  const r = await q('SELECT avatar, avatar_mime FROM users WHERE username = $1', [ref.slice(2)]);
+  if (!r.rows[0]?.avatar) throw new HttpError(404, 'no avatar');
+  res.set({
+    'Content-Type': r.rows[0].avatar_mime || 'image/jpeg',
+    'Cache-Control': 'private, max-age=31536000, immutable', // URL carries ?v=<rev>
+  });
+  res.send(r.rows[0].avatar);
+}));
 
 api.put('/me/settings', asyncRoute(async (req, res) => {
   const body = req.body || {};
@@ -152,7 +210,7 @@ api.get('/users/search', asyncRoute(async (req, res) => {
   if (qs.length < 2 || qs.length > 32 || !/^[a-z0-9_]+$/.test(qs)) return res.json({ results: [] });
   const prefix = qs.replaceAll('\\', '\\\\').replaceAll('_', '\\_').replaceAll('%', '\\%') + '%';
   const users = await q(
-    `SELECT username FROM users
+    `SELECT username, CASE WHEN avatar IS NULL THEN 0 ELSE avatar_rev END AS avatar_rev FROM users
      WHERE (username LIKE $1 ESCAPE '\\' AND COALESCE((settings->>'discoverable')::boolean, true))
         OR username = $2
      ORDER BY username LIMIT 10`,
@@ -165,8 +223,8 @@ api.get('/users/search', asyncRoute(async (req, res) => {
   );
   const results = [
     ...users.rows.filter((u) => u.username !== req.user.username)
-      .map((u) => ({ ref: `u:${u.username}`, username: u.username, kind: 'user' })),
-    ...bots.rows.map((b) => ({ ref: `b:${b.username}`, username: b.username, kind: 'bot' })),
+      .map((u) => ({ ref: `u:${u.username}`, username: u.username, kind: 'user', avatarRev: u.avatar_rev || 0 })),
+    ...bots.rows.map((b) => ({ ref: `b:${b.username}`, username: b.username, kind: 'bot', avatarRev: 0 })),
   ].slice(0, 10);
   res.json({ results });
 }));
@@ -176,13 +234,17 @@ api.get('/bundles/:ref', asyncRoute(async (req, res) => {
   if (!REF_RE.test(ref)) throw new HttpError(400, 'bad ref');
   const name = ref.slice(2);
   if (ref.startsWith('u:')) {
-    const r = await q('SELECT pub_bundle, settings FROM users WHERE username = $1', [name]);
+    const r = await q(
+      `SELECT pub_bundle, settings, CASE WHEN avatar IS NULL THEN 0 ELSE avatar_rev END AS avatar_rev
+       FROM users WHERE username = $1`, [name],
+    );
     if (!r.rows[0]) throw new HttpError(404, 'not found');
     const s = settingsOf(r.rows[0].settings);
     return res.json({
       ref, username: name, kind: 'user',
       bundle: r.rows[0].pub_bundle,
       online: s.showOnline ? isOnline(ref) : null,
+      avatarRev: r.rows[0].avatar_rev || 0,
     });
   }
   const r = await q('SELECT pub_bundle FROM bots WHERE username = $1', [name]);
@@ -321,21 +383,29 @@ api.post('/conversations', asyncRoute(async (req, res) => {
 
 api.get('/conversations', asyncRoute(async (req, res) => {
   const r = await q(
-    `SELECT c.id, c.type, c.name, c.scope, c.key_version, m.role AS my_role,
-       (SELECT json_agg(json_build_object('ref', mm.ref, 'role', mm.role) ORDER BY mm.added_at)
+    `SELECT c.id, c.type, c.name, c.scope, c.key_version, m.role AS my_role, m.pin_order,
+       (SELECT json_agg(json_build_object('ref', mm.ref, 'role', mm.role,
+          'avatarRev', COALESCE((SELECT CASE WHEN u.avatar IS NULL THEN 0 ELSE u.avatar_rev END
+                                 FROM users u WHERE 'u:' || u.username = mm.ref), 0))
+          ORDER BY mm.added_at)
           FROM members mm WHERE mm.conv_id = c.id) AS members,
        (SELECT row_to_json(t) FROM (
           SELECT id, sender_ref AS "senderRef", key_version AS "keyVersion", n, ct, sig,
-                 created_at AS ts
-          FROM messages WHERE conv_id = c.id ORDER BY id DESC LIMIT 1) t) AS last_message
+                 created_at AS ts, edited_at AS "editedAt"
+          FROM messages WHERE conv_id = c.id AND deleted_at IS NULL ORDER BY id DESC LIMIT 1) t) AS last_message,
+       (SELECT COALESCE(json_object_agg(rr.ref, rr.last_read_id), '{}'::json)
+          FROM reads rr WHERE rr.conv_id = c.id) AS reads
      FROM conversations c
      JOIN members m ON m.conv_id = c.id AND m.ref = $1
-     ORDER BY (SELECT COALESCE(max(id), 0) FROM messages WHERE conv_id = c.id) DESC, c.id DESC`,
+     ORDER BY (m.pin_order IS NULL), m.pin_order,
+       (SELECT COALESCE(max(id), 0) FROM messages WHERE conv_id = c.id AND deleted_at IS NULL) DESC, c.id DESC`,
     [req.user.ref],
   );
   const conversations = r.rows.map((c) => ({
     ...convSummary(c, c.my_role, c.members || []),
     lastMessage: c.last_message,
+    reads: c.reads || {},
+    pinOrder: c.pin_order,
   }));
   res.json({ conversations });
 }));
@@ -498,8 +568,9 @@ api.get('/conversations/:id/messages', asyncRoute(async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 100);
   const beforeId = Number(req.query.beforeId) || null;
   const r = await q(
-    `SELECT id, sender_ref AS "senderRef", key_version AS "keyVersion", n, ct, sig, created_at AS ts
-     FROM messages WHERE conv_id = $1 AND ($2::bigint IS NULL OR id < $2)
+    `SELECT id, sender_ref AS "senderRef", key_version AS "keyVersion", n, ct, sig, created_at AS ts,
+            edited_at AS "editedAt"
+     FROM messages WHERE conv_id = $1 AND deleted_at IS NULL AND ($2::bigint IS NULL OR id < $2)
      ORDER BY id DESC LIMIT $3`,
     [convId, beforeId, limit],
   );
@@ -531,6 +602,124 @@ api.post('/conversations/:id/messages', messageLimiter, asyncRoute(async (req, r
   };
   await deliverToConversation(convId, { type: 'message', convId, convType: conv.type, message });
   res.status(201).json({ id: message.id, ts: message.ts });
+}));
+
+// Edit: the sender re-encrypts the body under the current key and replaces
+// the ciphertext. The server never sees either version's plaintext.
+api.put('/conversations/:id/messages/:mid', messageLimiter, asyncRoute(async (req, res) => {
+  const convId = Number(req.params.id);
+  const mid = Number(req.params.mid);
+  const me = req.user.ref;
+  const { conv } = await requireMembership(convId, me);
+  if (!Number.isInteger(mid) || mid < 1) throw new HttpError(400, 'bad message id');
+  const m = req.body || {};
+  if (!isCipherMessage(m)) throw new HttpError(400, 'bad message');
+  if (m.keyVersion !== conv.key_version) {
+    throw new HttpError(409, `stale key version (current is ${conv.key_version})`);
+  }
+  const r = await q(
+    `UPDATE messages SET key_version = $1, n = $2, ct = $3, sig = $4, edited_at = now()
+     WHERE id = $5 AND conv_id = $6 AND sender_ref = $7 AND deleted_at IS NULL
+     RETURNING created_at AS ts, edited_at AS "editedAt"`,
+    [m.keyVersion, m.n, m.ct, m.sig, mid, convId, me],
+  );
+  if (r.rowCount === 0) throw new HttpError(404, 'message not found or not yours');
+  const message = {
+    id: String(mid), convId, senderRef: me, keyVersion: m.keyVersion,
+    n: m.n, ct: m.ct, sig: m.sig, ts: r.rows[0].ts, editedAt: r.rows[0].editedAt,
+  };
+  await deliverToConversation(convId, { type: 'message_edit', convId, message });
+  res.json({ id: message.id, editedAt: message.editedAt });
+}));
+
+// Delete: the ciphertext is destroyed server-side, not just flagged.
+api.delete('/conversations/:id/messages/:mid', asyncRoute(async (req, res) => {
+  const convId = Number(req.params.id);
+  const mid = Number(req.params.mid);
+  const me = req.user.ref;
+  const { conv, role } = await requireMembership(convId, me);
+  if (!Number.isInteger(mid) || mid < 1) throw new HttpError(400, 'bad message id');
+  const row = await q(
+    'SELECT sender_ref FROM messages WHERE id = $1 AND conv_id = $2 AND deleted_at IS NULL',
+    [mid, convId],
+  );
+  if (!row.rows[0]) throw new HttpError(404, 'message not found');
+  const canDelete = row.rows[0].sender_ref === me || (role === 'admin' && conv.type !== 'dm');
+  if (!canDelete) throw new HttpError(403, 'you can only delete your own messages');
+  await q(
+    "UPDATE messages SET n = '', ct = '', sig = '', deleted_at = now() WHERE id = $1",
+    [mid],
+  );
+  await deliverToConversation(convId, { type: 'message_delete', convId, messageId: String(mid), by: me });
+  res.json({ ok: true });
+}));
+
+// Read cursor (for sent → read double ticks). Not persisted to bots.
+api.post('/conversations/:id/read', asyncRoute(async (req, res) => {
+  const convId = Number(req.params.id);
+  const me = req.user.ref;
+  await requireMembership(convId, me);
+  const wanted = Number(req.body?.lastReadId);
+  if (!Number.isInteger(wanted) || wanted < 1) throw new HttpError(400, 'bad lastReadId');
+  const mx = await q(
+    'SELECT COALESCE(max(id), 0) AS mx FROM messages WHERE conv_id = $1 AND deleted_at IS NULL',
+    [convId],
+  );
+  const target = Math.min(wanted, Number(mx.rows[0].mx));
+  if (target < 1) return res.json({ ok: true, lastReadId: 0 });
+  const r = await q(
+    `INSERT INTO reads (conv_id, ref, last_read_id, updated_at) VALUES ($1, $2, $3, now())
+     ON CONFLICT (conv_id, ref) DO UPDATE
+       SET last_read_id = GREATEST(reads.last_read_id, EXCLUDED.last_read_id), updated_at = now()
+     RETURNING last_read_id AS "lastReadId"`,
+    [convId, me, target],
+  );
+  await deliverToConversation(convId, {
+    type: 'read', convId, ref: me, lastReadId: Number(r.rows[0].lastReadId),
+  }, { skipBotUpdate: true });
+  res.json({ ok: true, lastReadId: Number(r.rows[0].lastReadId) });
+}));
+
+// Delete a whole conversation: any DM participant ("delete for both", like
+// Telegram), or a room admin. Cascades messages, envelopes, blobs, reads.
+api.delete('/conversations/:id', asyncRoute(async (req, res) => {
+  const convId = Number(req.params.id);
+  const me = req.user.ref;
+  const { conv, role } = await requireMembership(convId, me);
+  if (conv.type !== 'dm' && role !== 'admin') {
+    throw new HttpError(403, 'only admins can delete a group or channel — leave it instead');
+  }
+  await deliverToConversation(convId, { type: 'conv_deleted', convId, by: me });
+  await q('DELETE FROM conversations WHERE id = $1', [convId]);
+  res.json({ ok: true });
+}));
+
+// Pinned chats: the client sends the full ordered list (top first).
+api.put('/me/pins', asyncRoute(async (req, res) => {
+  const order = req.body?.order;
+  if (!Array.isArray(order) || order.length > 100
+    || !order.every((x) => Number.isInteger(x) && x > 0)
+    || new Set(order).size !== order.length) {
+    throw new HttpError(400, 'order must be a unique list of conversation ids');
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('UPDATE members SET pin_order = NULL WHERE ref = $1', [req.user.ref]);
+    for (let i = 0; i < order.length; i++) {
+      await client.query(
+        'UPDATE members SET pin_order = $1 WHERE conv_id = $2 AND ref = $3',
+        [i, order[i], req.user.ref],
+      );
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+  res.json({ ok: true });
 }));
 
 // ------------------------------------------------------------------ blobs

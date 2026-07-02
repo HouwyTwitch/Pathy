@@ -15,9 +15,14 @@ secret keys never leave the client.
 - **Encrypted attachments** — send images (inline previews), links, and files
   up to 64 MB. Files are encrypted client-side with a one-off key that travels
   only inside the E2E-encrypted message; the server stores pure ciphertext.
+- **Voice messages** — record in the browser, sent through the same encrypted
+  blob pipeline, played back inline (Telegram-style).
+- **Telegram-style messaging UX** — read receipts (✓ → ✓✓), edit & delete
+  messages (delete destroys the ciphertext server-side), emoji picker and
+  stickers, avatars, pinned & reorderable chats, chat deletion.
 - **Modern, minimal UI** — light & dark themes, and full mobile support:
   single-pane navigation on phones, safe-area aware, installable (web
-  manifest).
+  manifest with on-screen-keyboard handling).
 - **Channels & groups** — Telegram-style: channels are broadcast (only admins
   post), groups let everyone post. Invites wrap the conversation keys to the
   new member's verified public keys; removing a member rotates the key.

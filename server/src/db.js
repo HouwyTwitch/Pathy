@@ -99,6 +99,25 @@ CREATE TABLE IF NOT EXISTS bot_updates (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS bot_updates_idx ON bot_updates(bot_id, id);
+
+-- Per-member read cursors (for sent/read ticks).
+CREATE TABLE IF NOT EXISTS reads (
+  conv_id      INT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  ref          TEXT NOT NULL,
+  last_read_id BIGINT NOT NULL DEFAULT 0,
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (conv_id, ref)
+);
+
+-- Idempotent migrations for columns added after the initial schema.
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at  TIMESTAMPTZ;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+-- Profile avatars (public to logged-in users, like usernames).
+ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar      BYTEA;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_mime TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_rev  INT NOT NULL DEFAULT 0;
+-- Per-user pinned-chat ordering (NULL = not pinned; ascending = top first).
+ALTER TABLE members ADD COLUMN IF NOT EXISTS pin_order DOUBLE PRECISION;
 `;
 
 export const pool = new pg.Pool({

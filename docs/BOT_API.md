@@ -42,19 +42,23 @@ All bot endpoints live under `/botapi/<token>/…`. No headers needed.
 
 ### Message body types
 
-The decrypted message body is JSON. Two types exist today:
+The decrypted message body is JSON:
 
 | body | Meaning |
 |---|---|
 | `{ t: "text", text }` | plain text (clients render http(s) links) |
-| `{ t: "file", name, size, mime, blobId, k, n }` | attachment: `blobId` points at an uploaded encrypted blob; `k`/`n` are the file key + nonce (base64url) for `decryptBlob` in [`shared/crypto.js`](../shared/crypto.js). The blob itself is XChaCha20-Poly1305 ciphertext — fetch it via `GET /blobs/:id` and decrypt locally. |
+| `{ t: "sticker", emoji }` | a sticker — clients render the emoji large |
+| `{ t: "file", name, size, mime, blobId, k, n, … }` | attachment: `blobId` points at an uploaded encrypted blob; `k`/`n` are the file key + nonce (base64url) for `decryptBlob` in [`shared/crypto.js`](../shared/crypto.js). The blob itself is XChaCha20-Poly1305 ciphertext — fetch it via `GET /blobs/:id` and decrypt locally. Extra fields: `w`/`h` (image dimensions), `kind: "voice"` + `dur` seconds (voice notes). |
 
 ### Update types
 
 | `type` | Emitted when | Payload highlights |
 |---|---|---|
 | `message` | a message lands in a conversation the bot belongs to | `convId`, `message { senderRef, keyVersion, n, ct, sig, ts }` |
+| `message_edit` | a sender replaced a message's ciphertext | `convId`, `message { …, editedAt }` |
+| `message_delete` | a message was deleted for everyone | `convId`, `messageId`, `by` |
 | `conv` | the bot is added to a conversation / a DM with the bot is created | `conversation`, initial `envelopes` |
+| `conv_deleted` | a conversation the bot belonged to was deleted | `convId`, `by` |
 | `envelope` | a key rotation wrapped a new key for the bot | `convId`, `keyVersion`, `envelopes` |
 | `member` | membership changes in the bot's conversations | `action: add/remove`, `ref`, `by` |
 

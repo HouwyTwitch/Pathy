@@ -1,6 +1,7 @@
 // Pathy web client. Rendering is plain DOM (no innerHTML for any
 // user-controlled string), state transitions re-render coarsely; text inputs
-// carry a data-fid marker so value/focus/selection survive re-renders.
+// carry a data-fid marker so value/focus/selection survive re-renders, and
+// the message box keeps its scroll position across re-renders.
 import { api, hasToken, setToken, onWsEvent, connectWs, disconnectWs } from './api.js';
 import * as store from './store.js';
 
@@ -8,17 +9,21 @@ const state = store.state;
 const ui = {
   view: 'chats',          // chats | settings | bots
   activeConvId: null,
-  msgs: new Map(),        // convId -> [{ id, localId?, pending?, senderRef, ts, body|error, verified }]
+  msgs: new Map(),        // convId -> [{ id, localId?, pending?, senderRef, ts, body|error, verified, editedAt }]
   loaded: new Set(),      // convIds whose history has been fetched
   unread: new Map(),      // convId -> count
   drafts: new Map(),      // convId -> composer draft
+  editing: null,          // { convId, id, prevDraft }
+  picker: null,           // null | 'emoji' | 'stickers'
   searchQuery: '',
   searchResults: null,
   modal: null,
 };
 
-let localSeq = 0;   // ids for optimistic local echoes
-let searchSeq = 0;  // drops stale search responses
+let localSeq = 0;        // ids for optimistic local echoes
+let searchSeq = 0;       // drops stale search responses
+let rec = null;          // active voice recording
+const lastReadSent = new Map(); // convId -> last read id reported to the server
 
 const app = document.getElementById('app');
 
@@ -31,10 +36,11 @@ function h(tag, attrs = {}, ...children) {
     if (k === 'class') el.className = v;
     else if (k === 'value') el.value = v;
     else if (k === 'checked') el.checked = !!v;
+    else if (k === 'hidden') el.hidden = !!v;
     else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
     else el.setAttribute(k, v);
   }
-  for (const c of children.flat()) {
+  for (const c of children.flat(Infinity)) {
     if (c === null || c === undefined) continue;
     el.append(c.nodeType ? c : document.createTextNode(String(c)));
   }
@@ -59,6 +65,7 @@ const ICONS = {
   file: '<path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/>',
   image: '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/>',
   check: '<polyline points="20 6 9 17 4 12"/>',
+  checks: '<path d="M18 6 7 17l-5-5"/><path d="m22 10-7.5 7.5L13 16"/>',
   clock: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
   lock: '<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
   users: '<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
@@ -67,6 +74,16 @@ const ICONS = {
   copy: '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
   plus: '<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>',
   trash: '<polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>',
+  pencil: '<path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>',
+  smile: '<circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/>',
+  mic: '<path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/>',
+  play: '<polygon points="6 3 20 12 6 21 6 3"/>',
+  pause: '<rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/>',
+  pin: '<path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1z"/>',
+  up: '<line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/>',
+  down: '<line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/>',
+  camera: '<path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/>',
+  more: '<circle cx="12" cy="12" r="1.4" fill="currentColor"/><circle cx="19" cy="12" r="1.4" fill="currentColor"/><circle cx="5" cy="12" r="1.4" fill="currentColor"/>',
 };
 
 function icon(name, cls = '') {
@@ -92,15 +109,60 @@ function toast(text, isError = false) {
 
 const errMsg = (err) => err?.message || 'something went wrong';
 
-function avatarFor(name, kind = 'user', online = false) {
+// Long-press support for touch devices that don't synthesize contextmenu.
+function addLongPress(el, fn) {
+  let timer = null;
+  let fired = false;
+  el.addEventListener('touchstart', () => {
+    fired = false;
+    timer = setTimeout(() => { timer = null; fired = true; fn(); }, 480);
+  }, { passive: true });
+  const cancel = () => { if (timer) clearTimeout(timer); timer = null; };
+  el.addEventListener('touchmove', cancel, { passive: true });
+  el.addEventListener('touchcancel', cancel);
+  el.addEventListener('touchend', (e) => {
+    cancel();
+    if (fired) { e.preventDefault(); e.stopPropagation(); }
+  });
+}
+
+// ---------------------------------------------------------------- avatars
+
+const avatarCache = new Map(); // `${ref}:${rev}` -> { url } | { loading } | { missing }
+
+function avatarUrl(ref, rev) {
+  if (!ref || !rev) return null;
+  const key = `${ref}:${rev}`;
+  let e = avatarCache.get(key);
+  if (!e) {
+    e = { loading: true };
+    avatarCache.set(key, e);
+    api.fetchAvatar(ref, rev).then((blob) => {
+      e.url = URL.createObjectURL(blob);
+      e.loading = false;
+      renderMain();
+    }).catch(() => { e.missing = true; e.loading = false; });
+  }
+  return e.url || null;
+}
+
+// av: { ref, rev } for principals that may have a profile picture.
+function avatarFor(name, kind = 'user', online = false, av = null) {
   const hue = [...name].reduce((a, c) => a + c.charCodeAt(0) * 7, 0) % 8;
-  const glyph = kind === 'bot' ? icon('bot', 'av-icon')
-    : kind === 'channel' ? icon('radio', 'av-icon')
-      : kind === 'group' ? icon('users', 'av-icon')
-        : (name[0] || '?').toUpperCase();
-  const av = h('div', { class: `avatar av${hue}` }, glyph);
-  if (online) av.append(h('span', { class: 'dot' }));
-  return av;
+  const url = av ? avatarUrl(av.ref, av.rev) : null;
+  const glyph = url ? h('img', { class: 'avatar-img', src: url, alt: '' })
+    : kind === 'bot' ? icon('bot', 'av-icon')
+      : kind === 'channel' ? icon('radio', 'av-icon')
+        : kind === 'group' ? icon('users', 'av-icon')
+          : (name[0] || '?').toUpperCase();
+  const el = h('div', { class: `avatar av${hue}${url ? ' has-img' : ''}` }, glyph);
+  if (online) el.append(h('span', { class: 'dot' }));
+  return el;
+}
+
+function memberAv(conv, ref) {
+  const m = conv?.members?.find((x) => x.ref === ref);
+  return m && m.avatarRev ? { ref, rev: m.avatarRev } : null;
 }
 
 const fmtTime = (ts) => new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -122,6 +184,11 @@ function fmtSize(bytes) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10240 ? 1 : 0)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function fmtDur(s) {
+  const sec = Math.max(0, Math.floor(s));
+  return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`;
 }
 
 function displayName(ref) {
@@ -157,6 +224,18 @@ function linkify(text) {
   }
   parts.push(text.slice(last));
   return parts;
+}
+
+// True for messages that are just 1-3 emoji — rendered big, like Telegram.
+function emojiOnly(text) {
+  if (!text || text.length > 24) return false;
+  try {
+    const seg = [...new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(text.trim())];
+    if (seg.length === 0 || seg.length > 3) return false;
+    return seg.every((s) => /\p{Extended_Pictographic}/u.test(s.segment));
+  } catch {
+    return false;
+  }
 }
 
 // --------------------------------------------------------- message list ops
@@ -200,6 +279,30 @@ function dropEcho(convId, localId) {
   const list = convMsgs(convId);
   const i = list.findIndex((m) => m.localId === localId);
   if (i >= 0) list.splice(i, 1);
+}
+
+// ------------------------------------------------------------ read cursors
+
+function maxOtherRead(conv) {
+  let max = 0;
+  for (const [ref, id] of Object.entries(conv.reads || {})) {
+    if (ref !== state.me.ref) max = Math.max(max, Number(id) || 0);
+  }
+  return max;
+}
+
+// Report "I've seen everything up to the newest message" for the open chat.
+function markRead(conv) {
+  if (!conv || document.visibilityState !== 'visible') return;
+  if (ui.view !== 'chats' || ui.activeConvId !== conv.id) return;
+  let maxId = 0;
+  for (const m of ui.msgs.get(conv.id) || []) {
+    if (m.id != null) maxId = Math.max(maxId, Number(m.id));
+  }
+  if (!maxId || (lastReadSent.get(conv.id) || 0) >= maxId) return;
+  lastReadSent.set(conv.id, maxId);
+  ui.unread.delete(conv.id);
+  api.markRead(conv.id, maxId).catch(() => lastReadSent.delete(conv.id));
 }
 
 // ---------------------------------------------------------------- screens
@@ -273,9 +376,13 @@ function renderMain() {
   const fid = active?.dataset?.fid || null;
   const sel = fid && typeof active.selectionStart === 'number'
     ? [active.selectionStart, active.selectionEnd] : null;
+  // preserve message-box scroll: stick to the bottom when the user is there,
+  // otherwise restore the exact offset (fixes the chat jumping on updates)
   const oldBox = app.querySelector('.messages');
+  const oldConv = oldBox?.dataset.conv;
   const stickBottom = !oldBox
     || oldBox.scrollTop + oldBox.clientHeight >= oldBox.scrollHeight - 48;
+  const prevScroll = oldBox?.scrollTop ?? 0;
 
   const sidebar = h('div', { class: 'sidebar' }, renderSidebarTop(), renderSearchOrChats(), renderSidebarBottom());
   const main = h('div', { class: 'main' });
@@ -294,7 +401,11 @@ function renderMain() {
   if (ui.modal) app.append(ui.modal);
 
   const box = app.querySelector('.messages');
-  if (box && stickBottom) box.scrollTop = box.scrollHeight;
+  if (box) {
+    const sameConv = oldBox && oldConv === box.dataset.conv;
+    if (!sameConv || stickBottom) box.scrollTop = box.scrollHeight;
+    else box.scrollTop = prevScroll;
+  }
   if (fid) {
     const el = app.querySelector(`[data-fid="${fid}"]`);
     if (el) {
@@ -354,9 +465,85 @@ function msgPreview(m) {
   if (m.error) return '…';
   const who = m.senderRef === state.me.ref ? 'you: ' : '';
   const b = m.body || {};
-  if (b.t === 'file') return `${who}${(b.mime || '').startsWith('image/') ? 'Photo' : (b.name || 'File')}`;
+  if (b.t === 'sticker') return `${who}Sticker ${b.emoji || ''}`;
+  if (b.t === 'file') {
+    if (b.kind === 'voice') return `${who}Voice message`;
+    return `${who}${(b.mime || '').startsWith('image/') ? 'Photo' : (b.name || 'File')}`;
+  }
   return `${who}${b.text ?? ''}`;
 }
+
+// ---- pinned chats
+
+const pinnedIds = () => state.conversations
+  .filter((c) => c.pinOrder != null)
+  .sort((a, b) => a.pinOrder - b.pinOrder)
+  .map((c) => c.id);
+
+async function savePins(order) {
+  try {
+    await api.savePins(order);
+    await refreshConversations();
+  } catch (e) { toast(errMsg(e), true); }
+}
+
+function togglePin(conv) {
+  const pins = pinnedIds();
+  const i = pins.indexOf(conv.id);
+  if (i >= 0) pins.splice(i, 1);
+  else pins.unshift(conv.id); // newly pinned goes on top, like Telegram
+  savePins(pins);
+}
+
+function movePin(conv, dir) {
+  const pins = pinnedIds();
+  const i = pins.indexOf(conv.id);
+  const j = i + dir;
+  if (i < 0 || j < 0 || j >= pins.length) return;
+  [pins[i], pins[j]] = [pins[j], pins[i]];
+  savePins(pins);
+}
+
+function openChatActions(conv) {
+  if (ui.modal) return;
+  const pinned = conv.pinOrder != null;
+  const pins = pinnedIds();
+  const pi = pins.indexOf(conv.id);
+  const canDelete = conv.type === 'dm' || conv.myRole === 'admin';
+  const item = (ic, label, fn, cls = '') =>
+    h('button', { class: `action-item ghost ${cls}`, onclick: () => { closeModal(); fn(); } }, icon(ic), label);
+  ui.modal = modal(convTitle(conv),
+    h('div', { class: 'action-list' },
+      item('pin', pinned ? 'Unpin' : 'Pin to top', () => togglePin(conv)),
+      pinned && pi > 0 ? item('up', 'Move up', () => movePin(conv, -1)) : null,
+      pinned && pi >= 0 && pi < pins.length - 1 ? item('down', 'Move down', () => movePin(conv, 1)) : null,
+      canDelete
+        ? item('trash', conv.type === 'dm' ? 'Delete chat (for both)' : 'Delete for everyone', async () => {
+          if (!confirm(conv.type === 'dm'
+            ? 'Delete this chat and its history for both sides?'
+            : `Delete ${convTitle(conv)} for all members?`)) return;
+          try {
+            await api.deleteConversation(conv.id);
+            forgetConv(conv.id);
+            await refreshConversations();
+          } catch (e) { toast(errMsg(e), true); }
+        }, 'danger-text')
+        : null,
+    ));
+  renderMain();
+}
+
+function forgetConv(convId) {
+  ui.msgs.delete(convId);
+  ui.loaded.delete(convId);
+  ui.unread.delete(convId);
+  ui.drafts.delete(convId);
+  lastReadSent.delete(convId);
+  if (ui.editing?.convId === convId) ui.editing = null;
+  if (ui.activeConvId === convId) ui.activeConvId = null;
+}
+
+let dragConvId = null;
 
 function renderSearchOrChats() {
   if (ui.searchResults) {
@@ -375,7 +562,7 @@ function renderSearchOrChats() {
             } catch (e) { toast(errMsg(e), true); renderMain(); }
           },
         },
-        avatarFor(r.username, r.kind),
+        avatarFor(r.username, r.kind, false, r.avatarRev ? { ref: r.ref, rev: r.avatarRev } : null),
         h('div', {}, h('div', { class: 'hit-name' }, displayName(r.ref)), h('div', { class: 'muted' }, r.kind)),
         )),
     );
@@ -389,32 +576,60 @@ function renderSearchOrChats() {
       const online = peer ? state.bundles.get(peer)?.online === true : false;
       const last = ui.msgs.get(conv.id)?.at(-1);
       const unread = ui.unread.get(conv.id) || 0;
-      return h('div', {
+      const pinned = conv.pinOrder != null;
+      const el = h('div', {
         class: `chat-item${conv.id === ui.activeConvId && ui.view === 'chats' ? ' active' : ''}`,
         onclick: () => openConv(conv.id),
+        oncontextmenu: (e) => { e.preventDefault(); openChatActions(conv); },
+        ...(pinned ? { draggable: 'true' } : {}),
       },
-      avatarFor(convTitle(conv), avatarKind(conv), online),
+      avatarFor(convTitle(conv), avatarKind(conv), online, peer ? memberAv(conv, peer) : null),
       h('div', { class: 'chat-body' },
         h('div', { class: 'chat-row' },
           h('div', { class: 'chat-name' }, convTitle(conv)),
+          pinned ? icon('pin', 'pin-mark') : null,
           last ? h('div', { class: 'chat-time' }, fmtTime(last.ts)) : null),
         h('div', { class: 'chat-row' },
           h('div', { class: 'chat-prev' }, msgPreview(last)),
           unread > 0 ? h('div', { class: 'unread-badge' }, unread > 99 ? '99+' : unread) : null)),
       );
+      addLongPress(el, () => openChatActions(conv));
+      if (pinned) {
+        el.addEventListener('dragstart', () => { dragConvId = conv.id; });
+        el.addEventListener('dragover', (e) => { e.preventDefault(); });
+        el.addEventListener('drop', (e) => {
+          e.preventDefault();
+          if (dragConvId == null || dragConvId === conv.id) return;
+          const pins = pinnedIds();
+          const from = pins.indexOf(dragConvId);
+          const to = pins.indexOf(conv.id);
+          if (from < 0 || to < 0) return;
+          pins.splice(to, 0, pins.splice(from, 1)[0]);
+          dragConvId = null;
+          savePins(pins);
+        });
+      }
+      return el;
     }),
   );
 }
 
 function renderSidebarBottom() {
   return h('div', { class: 'sidebar-bottom' },
-    avatarFor(state.me.username, 'user'),
+    avatarFor(state.me.username, 'user', false,
+      state.me.avatarRev ? { ref: state.me.ref, rev: state.me.avatarRev } : null),
     h('div', { class: 'who' }, `@${state.me.username}`),
     h('button', { class: 'icon-btn', title: 'Bots', 'aria-label': 'Bots', onclick: () => { ui.view = 'bots'; ui.activeConvId = null; renderMain(); } }, icon('bot')),
     h('button', { class: 'icon-btn', title: 'Settings', 'aria-label': 'Settings', onclick: () => { ui.view = 'settings'; ui.activeConvId = null; renderMain(); } }, icon('settings')),
     h('button', {
       class: 'icon-btn', title: 'Log out', 'aria-label': 'Log out',
-      onclick: async () => { await store.logout(); disconnectWs(); render(); },
+      onclick: async () => {
+        await store.logout();
+        disconnectWs();
+        for (const c of [avatarCache, mediaCache, audioCache]) c.clear();
+        lastReadSent.clear();
+        render();
+      },
     }, icon('logout')),
   );
 }
@@ -429,6 +644,7 @@ async function openConv(id) {
   ui.view = 'chats';
   ui.activeConvId = id;
   ui.unread.delete(id);
+  ui.picker = null;
   renderMain();
   const conv = findConv(id);
   if (!conv) return;
@@ -444,6 +660,7 @@ async function openConv(id) {
   }
   const peer = dmPeer(conv);
   if (peer && !state.bundles.has(peer)) store.getBundle(peer).then(() => renderMain()).catch(() => {});
+  markRead(conv);
   renderMain();
   const box = app.querySelector('.messages');
   if (box) box.scrollTop = box.scrollHeight;
@@ -507,11 +724,23 @@ function updateUploadProgress(localId, progress) {
   if (pct) pct.textContent = `${Math.round(progress * 100)}%`;
 }
 
-async function sendFiles(conv, files) {
+async function imageDims(file) {
+  try {
+    const bmp = await createImageBitmap(file);
+    const d = { w: bmp.width, h: bmp.height };
+    bmp.close();
+    return d;
+  } catch { return null; }
+}
+
+async function sendFiles(conv, files, extra = {}) {
   for (const file of files) {
     if (!file) continue;
     if (file.size === 0) { toast(`${file.name || 'file'}: cannot send an empty file`, true); continue; }
     if (file.size > store.MAX_FILE_BYTES) { toast(`${file.name || 'file'}: too large (max 64 MB)`, true); continue; }
+    const isImage = (file.type || '').startsWith('image/');
+    const dims = isImage ? await imageDims(file) : null;
+    const meta = { ...(dims || {}), ...extra };
     const localId = `local-${++localSeq}`;
     upsertMessage(conv.id, {
       localId,
@@ -520,12 +749,12 @@ async function sendFiles(conv, files) {
       senderRef: state.me.ref,
       ts: Date.now(),
       verified: true,
-      body: { t: 'file', name: file.name || 'file', size: file.size, mime: file.type || 'application/octet-stream' },
+      body: { t: 'file', name: file.name || 'file', size: file.size, mime: file.type || 'application/octet-stream', ...meta },
     });
     renderMain();
     try {
-      const sent = await store.sendFile(conv, file, (p) => updateUploadProgress(localId, p));
-      if (sent.body.blobId && (file.type || '').startsWith('image/')) {
+      const sent = await store.sendFile(conv, file, (p) => updateUploadProgress(localId, p), meta);
+      if (sent.body.blobId && isImage) {
         mediaCache.set(sent.body.blobId, { url: URL.createObjectURL(file) });
       }
       resolveEcho(conv.id, localId, sent);
@@ -537,21 +766,158 @@ async function sendFiles(conv, files) {
   }
 }
 
+// ---- voice messages
+
+const audioCache = new Map(); // blobId -> { loading?, url?, audio?, playing? }
+
+async function toggleVoice(body) {
+  let entry = audioCache.get(body.blobId);
+  if (entry?.loading) return;
+  if (!entry) {
+    entry = { loading: true };
+    audioCache.set(body.blobId, entry);
+    renderMain();
+    try {
+      const bytes = await store.fetchFile(body);
+      entry.url = URL.createObjectURL(new Blob([bytes], { type: body.mime || 'audio/webm' }));
+      const audio = new Audio(entry.url);
+      entry.audio = audio;
+      audio.addEventListener('timeupdate', () => updateVoiceDom(body));
+      audio.addEventListener('ended', () => { entry.playing = false; renderMain(); });
+    } catch (e) {
+      audioCache.delete(body.blobId);
+      renderMain();
+      return toast(errMsg(e), true);
+    }
+    entry.loading = false;
+  }
+  if (!entry.audio) return;
+  if (entry.playing) {
+    entry.audio.pause();
+    entry.playing = false;
+  } else {
+    for (const [, o] of audioCache) if (o.playing && o.audio) { o.audio.pause(); o.playing = false; }
+    entry.playing = true;
+    entry.audio.play().catch(() => { entry.playing = false; renderMain(); });
+  }
+  renderMain();
+}
+
+function updateVoiceDom(body) {
+  const entry = audioCache.get(body.blobId);
+  if (!entry?.audio) return;
+  const row = app.querySelector(`[data-vid="${body.blobId}"]`);
+  if (!row) return;
+  const dur = body.dur || entry.audio.duration || 1;
+  const fill = row.querySelector('.voice-fill');
+  if (fill) fill.style.width = `${Math.min(100, (entry.audio.currentTime / dur) * 100)}%`;
+  const t = row.querySelector('.voice-time');
+  if (t) t.textContent = `${fmtDur(entry.audio.currentTime)} / ${fmtDur(dur)}`;
+}
+
+function voiceRow(m) {
+  const b = m.body;
+  const entry = audioCache.get(b.blobId);
+  const playing = entry?.playing === true;
+  const fill = h('div', { class: 'voice-fill' });
+  if (entry?.audio && b.dur) {
+    fill.style.width = `${Math.min(100, (entry.audio.currentTime / b.dur) * 100)}%`;
+  }
+  const track = h('div', {
+    class: 'voice-track',
+    onclick: (e) => {
+      if (!entry?.audio || !b.dur) return;
+      const rect = e.currentTarget.getBoundingClientRect();
+      entry.audio.currentTime = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)) * b.dur;
+      updateVoiceDom(b);
+    },
+  }, fill);
+  return h('div', { class: 'voice-row', 'data-vid': b.blobId },
+    h('button', {
+      class: 'voice-play', title: playing ? 'Pause' : 'Play',
+      'aria-label': playing ? 'Pause voice message' : 'Play voice message',
+      onclick: () => toggleVoice(b),
+    }, entry?.loading ? h('span', { class: 'voice-spin' }) : icon(playing ? 'pause' : 'play')),
+    h('div', { class: 'voice-mid' },
+      track,
+      h('span', { class: 'voice-time' },
+        entry?.audio && playing
+          ? `${fmtDur(entry.audio.currentTime)} / ${fmtDur(b.dur || 0)}`
+          : fmtDur(b.dur || 0))));
+}
+
+async function startRecording(conv) {
+  if (rec) return;
+  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+    return toast('voice recording is not supported in this browser', true);
+  }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch {
+    return toast('microphone permission denied', true);
+  }
+  const mime = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4']
+    .find((t) => MediaRecorder.isTypeSupported(t)) || '';
+  const recorder = new MediaRecorder(stream, mime ? { mimeType: mime, audioBitsPerSecond: 64000 } : undefined);
+  const chunks = [];
+  recorder.ondataavailable = (e) => { if (e.data?.size) chunks.push(e.data); };
+  recorder.onstop = () => {
+    stream.getTracks().forEach((t) => t.stop());
+    const r = rec;
+    rec = null;
+    if (r) clearInterval(r.interval);
+    renderMain();
+    if (!r || r.canceled) return;
+    const dur = (Date.now() - r.startTs) / 1000;
+    if (dur < 0.4 || chunks.length === 0) return toast('recording too short', true);
+    const type = recorder.mimeType || mime || 'audio/webm';
+    const ext = type.includes('mp4') ? 'm4a' : (type.includes('ogg') ? 'ogg' : 'webm');
+    const stamp = new Date().toISOString().slice(0, 19).replaceAll(':', '-');
+    const file = new File(chunks, `voice-${stamp}.${ext}`, { type });
+    sendFiles(r.conv, [file], { kind: 'voice', dur: Math.round(dur * 10) / 10 });
+  };
+  rec = {
+    conv,
+    recorder,
+    stream,
+    startTs: Date.now(),
+    canceled: false,
+    interval: setInterval(() => {
+      if (!rec) return;
+      const el = app.querySelector('.rec-timer');
+      if (el) el.textContent = fmtDur((Date.now() - rec.startTs) / 1000);
+      if (Date.now() - rec.startTs > 600_000) stopRecording(false); // 10 min cap
+    }, 250),
+  };
+  recorder.start();
+  renderMain();
+}
+
+function stopRecording(cancel) {
+  if (!rec) return;
+  rec.canceled = cancel;
+  try { rec.recorder.stop(); } catch { /* already stopped */ }
+}
+
 function fileBubbleContent(m) {
   const b = m.body;
   const isImage = (b.mime || '').startsWith('image/');
+  const isVoice = b.kind === 'voice';
 
   if (m.pending && m.uploading !== undefined) {
     const pct = Math.round((m.uploading || 0) * 100);
     const fill = h('div', { class: 'upload-fill' });
     fill.style.width = `${pct}%`;
     return h('div', { class: 'file-row' },
-      h('div', { class: 'file-icon' }, icon(isImage ? 'image' : 'file')),
+      h('div', { class: 'file-icon' }, icon(isVoice ? 'mic' : (isImage ? 'image' : 'file'))),
       h('div', { class: 'file-meta' },
-        h('div', { class: 'file-name' }, b.name),
+        h('div', { class: 'file-name' }, isVoice ? 'Voice message' : b.name),
         h('div', { class: 'upload-track' }, fill),
         h('div', { class: 'muted' }, h('span', { class: 'upload-pct' }, `${pct}%`), ` of ${fmtSize(b.size)} — encrypting & uploading`)));
   }
+
+  if (isVoice && b.blobId) return voiceRow(m);
 
   if (isImage && b.blobId) {
     const entry = (b.size <= AUTOLOAD_IMAGE_BYTES || mediaCache.has(b.blobId)) ? ensureImage(b) : null;
@@ -560,11 +926,17 @@ function fileBubbleContent(m) {
         icon('image'), ` Load image (${fmtSize(b.size)})`);
     }
     if (entry.error) return h('div', { class: 'broken-text' }, `⚠ ${entry.error}`);
-    if (entry.loading) return h('div', { class: 'img-loading' }, icon('image'), ' decrypting…');
-    return h('img', {
+    if (entry.loading) {
+      const ph = h('div', { class: 'img-loading' }, icon('image'), ' decrypting…');
+      if (b.w && b.h) { ph.style.aspectRatio = `${b.w} / ${b.h}`; ph.style.width = '320px'; }
+      return ph;
+    }
+    const img = h('img', {
       class: 'img-attach', src: entry.url, alt: b.name,
       onclick: () => openImageViewer(entry.url, b.name),
     });
+    if (b.w && b.h) img.style.aspectRatio = `${b.w} / ${b.h}`; // reserve space, no layout jump
+    return img;
   }
 
   const dlBtn = h('button', { class: 'icon-btn dl', title: `Download ${b.name}`, 'aria-label': `Download ${b.name}` }, icon('download'));
@@ -575,6 +947,143 @@ function fileBubbleContent(m) {
       h('div', { class: 'file-name' }, b.name),
       h('div', { class: 'muted' }, fmtSize(b.size))),
     dlBtn);
+}
+
+// ---- message actions (edit / delete / copy)
+
+function openMsgActions(conv, m) {
+  if (ui.modal || m.id == null || m.pending) return;
+  const mine = m.senderRef === state.me.ref;
+  const canEdit = mine && !m.error && m.body?.t === 'text';
+  const canDelete = mine || (conv.myRole === 'admin' && conv.type !== 'dm');
+  const items = [];
+  const item = (ic, label, fn, cls = '') =>
+    h('button', { class: `action-item ghost ${cls}`, onclick: () => { closeModal(); fn(); } }, icon(ic), label);
+  if (!m.error && m.body?.t === 'text') {
+    items.push(item('copy', 'Copy text', () =>
+      navigator.clipboard?.writeText(m.body.text).then(() => toast('copied')).catch(() => {})));
+  }
+  if (canEdit) items.push(item('pencil', 'Edit', () => startEdit(conv, m)));
+  if (canDelete) {
+    items.push(item('trash', 'Delete for everyone', async () => {
+      if (!confirm('Delete this message for everyone?')) return;
+      try {
+        await api.deleteMessage(conv.id, m.id);
+        const list = convMsgs(conv.id);
+        const i = list.findIndex((x) => String(x.id) === String(m.id));
+        if (i >= 0) list.splice(i, 1);
+        renderMain();
+      } catch (e) { toast(errMsg(e), true); }
+    }, 'danger-text'));
+  }
+  if (items.length === 0) return;
+  ui.modal = modal('Message', h('div', { class: 'action-list' }, items));
+  renderMain();
+}
+
+function startEdit(conv, m) {
+  ui.editing = { convId: conv.id, id: m.id, prevDraft: ui.drafts.get(conv.id) || '' };
+  ui.drafts.set(conv.id, m.body.text);
+  ui.picker = null;
+  renderMain();
+  const input = app.querySelector('[data-fid="composer"]');
+  if (input) { input.focus(); input.setSelectionRange(input.value.length, input.value.length); }
+}
+
+function cancelEdit(conv) {
+  if (!ui.editing) return;
+  ui.drafts.set(conv.id, ui.editing.prevDraft || '');
+  ui.editing = null;
+  renderMain();
+}
+
+// ---- emoji & stickers
+
+const EMOJI = {
+  Smileys: '😀 😃 😄 😁 😆 😅 😂 🤣 😊 😇 🙂 🙃 😉 😌 😍 🥰 😘 😗 😙 😚 😋 😛 😝 😜 🤪 🤨 🧐 🤓 😎 🥸 🤩 🥳 😏 😒 😞 😔 😟 😕 🙁 😣 😖 😫 😩 🥺 😢 😭 😤 😠 😡 🤬 🤯 😳 🥵 🥶 😱 😨 😰 😥 😓 🤗 🤔 🤭 🤫 🤥 😶 😐 😑 😬 🙄 😯 😦 😧 😮 😲 🥱 😴 🤤 😪 😵 🤐 🥴 🤢 🤮 🤧 😷 🤒 🤕 🤑 🤠 😈 👿 🤡 💩 👻 💀 👽 👾 🤖 🎃 😺 😸 😹 😻 😼 😽 🙀 😿 😾'.split(' '),
+  Gestures: '👋 🤚 🖐 ✋ 🖖 👌 🤌 🤏 ✌️ 🤞 🤟 🤘 🤙 👈 👉 👆 🖕 👇 ☝️ 👍 👎 ✊ 👊 🤛 🤜 👏 🙌 👐 🤲 🤝 🙏 ✍️ 💅 🤳 💪 🦾 🦵 🦶 👂 👃 🧠 🦷 👀 👁 👅 👄'.split(' '),
+  Hearts: '❤️ 🧡 💛 💚 💙 💜 🖤 🤍 🤎 💔 ❣️ 💕 💞 💓 💗 💖 💘 💝 💟 💋 💯 💢 💥 💫 💦 💨 💬 💭 💤'.split(' '),
+  Animals: '🐶 🐱 🐭 🐹 🐰 🦊 🐻 🐼 🐨 🐯 🦁 🐮 🐷 🐸 🐵 🙈 🙉 🙊 🐒 🐔 🐧 🐦 🐤 🦆 🦅 🦉 🦇 🐺 🐗 🐴 🦄 🐝 🐛 🦋 🐌 🐞 🐜 🦂 🐢 🐍 🦎 🦖 🦕 🐙 🦑 🦐 🦞 🦀 🐡 🐠 🐟 🐬 🐳 🐋 🦈 🐊 🐅 🐆 🦓 🦍 🐘 🦛 🦏 🐪 🐫 🦒 🦘 🐃 🐂 🐄 🐎 🐖 🐏 🐑 🦙 🐐 🦌 🐕 🐩 🐈 🐓 🦃 🦚 🦜 🦢 🦩 🕊 🐇 🦝 🦨 🦡 🦦 🦥 🐿 🦔'.split(' '),
+  Food: '🍏 🍎 🍐 🍊 🍋 🍌 🍉 🍇 🍓 🫐 🍈 🍒 🍑 🥭 🍍 🥥 🥝 🍅 🍆 🥑 🥦 🥒 🌶 🌽 🥕 🥔 🍠 🥐 🍞 🥖 🥨 🧀 🥚 🍳 🥞 🧇 🥓 🥩 🍗 🍖 🌭 🍔 🍟 🍕 🥪 🌮 🌯 🥗 🍝 🍜 🍲 🍛 🍣 🍱 🥟 🍤 🍙 🍚 🍘 🥠 🍢 🍡 🍧 🍨 🍦 🥧 🧁 🍰 🎂 🍮 🍭 🍬 🍫 🍿 🍩 🍪 🌰 🥜 ☕ 🍵 🧃 🥤 🧋 🍶 🍺 🍻 🥂 🍷 🥃 🍸 🍹 🍾'.split(' '),
+  Activity: '⚽ 🏀 🏈 ⚾ 🎾 🏐 🏉 🎱 🏓 🏸 🏒 🥅 ⛳ 🏹 🎣 🥊 🥋 ⛸ 🎿 🏂 🏋️ 🤸 🤺 ⛹️ 🏌️ 🏇 🧘 🏄 🏊 🚣 🧗 🚵 🚴 🏆 🥇 🥈 🥉 🏅 🎖 🎫 🎪 🤹 🎭 🎨 🎬 🎤 🎧 🎼 🎹 🥁 🎷 🎺 🎸 🎻 🎲 ♟ 🎯 🎳 🎮 🎰 🧩'.split(' '),
+  Objects: '⌚ 📱 💻 ⌨️ 🖥 🖨 🖱 💾 💿 📷 📸 📹 🎥 📞 ☎️ 📺 📻 🧭 ⏰ ⌛ 📡 🔋 🔌 💡 🔦 🕯 💸 💵 💰 💳 💎 ⚖️ 🧰 🔧 🔨 ⚙️ 🧲 🔫 💣 🔪 🛡 🚬 ⚰️ 🔮 💈 🔭 🔬 💊 💉 🧬 🦠 🧪 🌡 🧹 🧺 🚽 🚿 🛁 🧼 🪥 🧽 🛎 🔑 🚪 🪑 🛏 🧸 🖼 🛍 🛒 🎁 🎈 🎀 🎊 🎉 🏮 ✉️ 📦 📜 📄 📊 📈 📉 📅 📋 📁 📰 📚 📖 🔖 🔗 📎 📐 📏 📌 📍 ✂️ 🖊 ✏️ 🔍 🔒 🔓'.split(' '),
+  Symbols: '✅ ❌ ❓ ❗ ⭐ 🌟 ✨ ⚡ 🔥 🌈 ☀️ ⛅ 🌧 ⛈ ❄️ ⛄ 💧 🌊 ☔ ⚠️ 🚫 ♻️ 💤 🆗 🆒 🆕 🆓 🆙 🎵 🎶 ➕ ➖ ➗ ✖️ 💲 ✔️ ☑️ 🔴 🟠 🟡 🟢 🔵 🟣 ⚫ ⚪ 🟤 🔺 🔻 🔸 🔹 🔶 🔷 🟥 🟧 🟨 🟩 🟦 🟪 ⬛ ⬜ 🔈 🔊 🔔 🔕 📣 📢 🏁 🚩'.split(' '),
+};
+
+const STICKERS = ('😂 🤣 😍 🥰 😎 🤩 🥳 😜 🤪 😇 😉 😊 🙃 😏 🤤 😴 🥱 🤯 😱 😭 🥺 😢 😡 🤬 🤔 🧐 🙄 😬 🤫 🤭 '
+  + '👍 👎 👏 🙏 💪 🤝 ✌️ 🤟 🤘 👌 👀 💋 🔥 ❤️ 💔 💯 ✨ 🎉 🎂 🌹 🌈 ☀️ ⚡ ⭐ 🍕 🍺 ☕ ⚽ 🚀 🐱 🐶 🦄 🙈 💩 🤖 👻 🎃').split(' ');
+
+function insertEmojiIntoComposer(emoji) {
+  const input = app.querySelector('[data-fid="composer"]');
+  if (!input) return;
+  const s = input.selectionStart ?? input.value.length;
+  const e = input.selectionEnd ?? s;
+  input.value = input.value.slice(0, s) + emoji + input.value.slice(e);
+  const pos = s + emoji.length;
+  input.setSelectionRange(pos, pos);
+  input.dispatchEvent(new Event('input')); // updates draft + send button
+  input.focus();
+}
+
+let pickerCache = null; // { tab, el } — heavy DOM, rebuilt only when the tab changes
+
+function buildPicker() {
+  const tabBtn = (tab, label) => h('button', {
+    class: `picker-tab${ui.picker === tab ? ' active' : ''}`,
+    onclick: () => { ui.picker = tab; pickerCache = null; renderMain(); },
+  }, label);
+  const head = h('div', { class: 'picker-tabs' }, tabBtn('emoji', 'Emoji'), tabBtn('stickers', 'Stickers'),
+    h('div', { class: 'spacer' }),
+    h('button', { class: 'icon-btn', title: 'Close', 'aria-label': 'Close picker', onclick: () => { ui.picker = null; renderMain(); } }, icon('x')));
+  let body;
+  if (ui.picker === 'stickers') {
+    body = h('div', { class: 'picker-body' },
+      h('div', { class: 'sticker-grid' },
+        STICKERS.map((st) => h('button', {
+          class: 'sticker-cell',
+          onclick: () => {
+            const conv = findConv(ui.activeConvId);
+            if (conv) sendStickerFlow(conv, st);
+          },
+        }, st))));
+  } else {
+    body = h('div', { class: 'picker-body' },
+      Object.entries(EMOJI).map(([cat, list]) => [
+        h('div', { class: 'picker-cat' }, cat),
+        h('div', { class: 'emoji-grid' },
+          list.map((em) => h('button', {
+            class: 'emoji-cell',
+            onclick: () => insertEmojiIntoComposer(em),
+          }, em))),
+      ]));
+  }
+  return h('div', { class: 'picker' }, head, body);
+}
+
+function renderPicker() {
+  if (!ui.picker) { pickerCache = null; return null; }
+  if (!pickerCache || pickerCache.tab !== ui.picker) {
+    pickerCache = { tab: ui.picker, el: buildPicker() };
+  }
+  return pickerCache.el;
+}
+
+async function sendStickerFlow(conv, emoji) {
+  ui.picker = null;
+  const localId = `local-${++localSeq}`;
+  upsertMessage(conv.id, {
+    localId, pending: true, senderRef: state.me.ref, ts: Date.now(),
+    body: { t: 'sticker', emoji }, verified: true,
+  });
+  renderMain();
+  try {
+    const sent = await store.sendSticker(conv, emoji);
+    resolveEcho(conv.id, localId, sent);
+  } catch (e) {
+    dropEcho(conv.id, localId);
+    toast(errMsg(e), true);
+  }
+  renderMain();
 }
 
 // ---- messages
@@ -595,7 +1104,7 @@ function renderChat() {
       class: 'icon-btn back-btn', title: 'Back', 'aria-label': 'Back',
       onclick: () => { ui.activeConvId = null; renderMain(); },
     }, icon('back')),
-    avatarFor(convTitle(conv), avatarKind(conv), peerInfo?.online === true),
+    avatarFor(convTitle(conv), avatarKind(conv), peerInfo?.online === true, peer ? memberAv(conv, peer) : null),
     h('div', { class: 'chat-head-text', onclick: () => openInfoModal(conv) },
       h('div', { class: 'title' }, convTitle(conv)),
       sub ? h('div', { class: `muted${peerInfo?.online === true ? ' online-text' : ''}` }, sub) : null),
@@ -609,6 +1118,7 @@ function renderChat() {
   );
 
   const msgs = ui.msgs.get(conv.id) || [];
+  const otherRead = maxOtherRead(conv);
   const rows = [];
   let lastDay = null;
   for (const m of msgs) {
@@ -618,31 +1128,71 @@ function renderChat() {
       lastDay = day;
     }
     const mine = m.senderRef === state.me.ref;
-    const isMedia = !m.error && m.body?.t === 'file' && (m.body.mime || '').startsWith('image/') && !m.uploading && !m.pending;
-    rows.push(h('div', { class: `msg${mine ? ' out' : ''}`, 'data-mid': m.localId || m.id },
+    const isSticker = !m.error && m.body?.t === 'sticker';
+    const isBigEmoji = !m.error && m.body?.t === 'text' && emojiOnly(m.body.text);
+    const isMedia = !m.error && m.body?.t === 'file' && (m.body.mime || '').startsWith('image/')
+      && m.body.kind !== 'voice' && !m.uploading && !m.pending;
+    const read = mine && !m.pending && m.id != null && Number(m.id) <= otherRead;
+
+    const stamp = h('span', { class: 'stamp' },
+      !m.error && !m.pending && m.verified === false
+        ? h('span', { class: 'unverified', title: 'signature could not be verified' }, '⚠ unverified')
+        : null,
+      m.editedAt ? h('span', { class: 'edited' }, 'edited') : null,
+      h('span', { class: 'time' }, fmtTime(m.ts)),
+      mine ? h('span', { class: `tick${read ? ' read' : ''}`, title: m.pending ? 'sending' : (read ? 'read' : 'sent') },
+        icon(m.pending ? 'clock' : (read ? 'checks' : 'check'))) : null);
+
+    let content;
+    if (m.error) content = h('span', { class: 'text' }, `⚠ ${m.error}`);
+    else if (isSticker) content = h('div', { class: 'sticker-emoji' }, m.body.emoji || '');
+    else if (m.body?.t === 'file') content = fileBubbleContent(m);
+    else content = h('span', { class: 'text' }, linkify(m.body?.text ?? ''));
+
+    const bubble = h('div', {
+      class: `bubble${m.error ? ' broken' : ''}${isMedia ? ' media' : ''}${isSticker ? ' sticker-bubble' : ''}${isBigEmoji ? ' big-emoji' : ''}`,
+    }, content, stamp);
+
+    const msgEl = h('div', { class: `msg${mine ? ' out' : ''}`, 'data-mid': m.localId || m.id },
       conv.type !== 'dm' && !mine
         ? h('div', { class: 'meta' }, h('span', { class: 'sender' }, displayName(m.senderRef)))
         : null,
-      h('div', { class: `bubble${m.error ? ' broken' : ''}${isMedia ? ' media' : ''}` },
-        m.error ? h('span', { class: 'text' }, `⚠ ${m.error}`)
-          : (m.body?.t === 'file' ? fileBubbleContent(m) : h('span', { class: 'text' }, linkify(m.body?.text ?? ''))),
-        h('span', { class: 'stamp' },
-          !m.error && !m.pending && m.verified === false
-            ? h('span', { class: 'unverified', title: 'signature could not be verified' }, '⚠ unverified')
-            : null,
-          h('span', { class: 'time' }, fmtTime(m.ts)),
-          mine ? h('span', { class: 'tick' }, icon(m.pending ? 'clock' : 'check')) : null)),
-    ));
+      bubble,
+      m.id != null && !m.pending
+        ? h('button', {
+          class: 'msg-menu icon-btn', title: 'Message actions', 'aria-label': 'Message actions',
+          onclick: (e) => { e.stopPropagation(); openMsgActions(conv, m); },
+        }, icon('more'))
+        : null,
+    );
+    bubble.addEventListener('contextmenu', (e) => { e.preventDefault(); openMsgActions(conv, m); });
+    addLongPress(bubble, () => openMsgActions(conv, m));
+    rows.push(msgEl);
   }
 
-  const box = h('div', { class: 'messages' },
+  const box = h('div', { class: 'messages', 'data-conv': String(conv.id) },
     msgs.length === 0
       ? h('div', { class: 'day-sep' }, h('span', {}, 'No messages yet — everything you send is end-to-end encrypted'))
       : null,
     rows);
 
   let bottom;
-  if (canPost) {
+  if (rec && rec.conv.id === conv.id) {
+    bottom = h('div', { class: 'composer recording' },
+      h('button', {
+        class: 'icon-btn rec-cancel', title: 'Cancel recording', 'aria-label': 'Cancel recording',
+        onclick: () => stopRecording(true),
+      }, icon('trash')),
+      h('span', { class: 'rec-dot' }),
+      h('span', { class: 'rec-timer' }, fmtDur((Date.now() - rec.startTs) / 1000)),
+      h('div', { class: 'spacer' }),
+      h('div', { class: 'muted rec-hint' }, 'recording voice message'),
+      h('button', {
+        class: 'send-btn has-text', title: 'Send voice message', 'aria-label': 'Send voice message',
+        onclick: () => stopRecording(false),
+      }, icon('send')));
+  } else if (canPost) {
+    const editingThis = ui.editing?.convId === conv.id;
     const fileInput = h('input', {
       type: 'file', class: 'hidden-file', multiple: '',
       onchange: (e) => {
@@ -654,7 +1204,7 @@ function renderChat() {
     const input = h('input', {
       class: 'composer-input',
       'data-fid': 'composer',
-      placeholder: 'Message',
+      placeholder: editingThis ? 'Edit message' : 'Message',
       maxlength: '4096',
       autocomplete: 'off',
       value: ui.drafts.get(conv.id) || '',
@@ -669,6 +1219,21 @@ function renderChat() {
       if (!text) return;
       input.value = '';
       ui.drafts.delete(conv.id);
+
+      if (editingThis) {
+        const ed = ui.editing;
+        ui.editing = null;
+        try {
+          const res = await store.editText(conv, ed.id, text);
+          const list = convMsgs(conv.id);
+          const msg = list.find((x) => String(x.id) === String(ed.id));
+          if (msg) { msg.body = { t: 'text', text }; msg.editedAt = res.editedAt; msg.verified = true; }
+          if (ed.prevDraft) ui.drafts.set(conv.id, ed.prevDraft);
+        } catch (e) { toast(errMsg(e), true); }
+        renderMain();
+        return;
+      }
+
       const localId = `local-${++localSeq}`;
       upsertMessage(conv.id, {
         localId, pending: true, senderRef: state.me.ref, ts: Date.now(),
@@ -685,17 +1250,50 @@ function renderChat() {
       }
       renderMain();
     };
-    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') send();
+      else if (e.key === 'Escape') {
+        if (editingThis) cancelEdit(conv);
+        else if (ui.picker) { ui.picker = null; renderMain(); }
+      }
+    });
     const sendBtn = h('button', { class: 'send-btn', title: 'Send', 'aria-label': 'Send', onclick: send }, icon('send'));
-    const syncSend = () => sendBtn.classList.toggle('has-text', input.value.trim().length > 0);
+    const micBtn = h('button', {
+      class: 'icon-btn mic-btn', title: 'Record a voice message', 'aria-label': 'Record a voice message',
+      onclick: () => startRecording(conv),
+    }, icon('mic'));
+    const syncSend = () => {
+      const has = input.value.trim().length > 0;
+      sendBtn.classList.toggle('has-text', has || editingThis);
+      sendBtn.hidden = !has && !editingThis;
+      micBtn.hidden = has || editingThis;
+    };
     syncSend();
-    bottom = h('div', { class: 'composer' },
-      fileInput,
-      h('button', {
-        class: 'icon-btn', title: 'Attach a file (up to 64 MB)', 'aria-label': 'Attach a file',
-        onclick: () => fileInput.click(),
-      }, icon('paperclip')),
-      input, sendBtn);
+
+    const editBar = editingThis
+      ? h('div', { class: 'edit-bar' },
+        icon('pencil', 'edit-ic'),
+        h('div', { class: 'edit-info' },
+          h('div', { class: 'edit-title' }, 'Editing message'),
+          h('div', { class: 'muted ellip' },
+            (ui.msgs.get(conv.id) || []).find((x) => String(x.id) === String(ui.editing.id))?.body?.text || '')),
+        h('button', { class: 'icon-btn', title: 'Cancel editing', 'aria-label': 'Cancel editing', onclick: () => cancelEdit(conv) }, icon('x')))
+      : null;
+
+    bottom = h('div', { class: 'composer-wrap' },
+      renderPicker(),
+      editBar,
+      h('div', { class: 'composer' },
+        fileInput,
+        h('button', {
+          class: `icon-btn${ui.picker ? ' active-ic' : ''}`, title: 'Emoji & stickers', 'aria-label': 'Emoji and stickers',
+          onclick: () => { ui.picker = ui.picker ? null : 'emoji'; renderMain(); },
+        }, icon('smile')),
+        h('button', {
+          class: 'icon-btn', title: 'Attach a file (up to 64 MB)', 'aria-label': 'Attach a file',
+          onclick: () => fileInput.click(),
+        }, icon('paperclip')),
+        input, micBtn, sendBtn));
 
     // drag & drop anywhere over the message area
     box.addEventListener('dragover', (e) => { e.preventDefault(); box.classList.add('droppable'); });
@@ -766,7 +1364,8 @@ function openInfoModal(conv) {
   }
 
   const rows = conv.members.map((m) => h('div', { class: 'member-row' },
-    avatarFor(m.ref.slice(2), m.ref.startsWith('b:') ? 'bot' : 'user'),
+    avatarFor(m.ref.slice(2), m.ref.startsWith('b:') ? 'bot' : 'user', false,
+      m.avatarRev ? { ref: m.ref, rev: m.avatarRev } : null),
     h('div', { class: 'name' }, displayName(m.ref), ' ', m.role === 'admin' ? h('span', { class: 'badge' }, 'admin') : null),
     h('button', {
       class: 'icon-btn', title: `verify ${displayName(m.ref)}`, 'aria-label': `verify ${displayName(m.ref)}`,
@@ -852,7 +1451,7 @@ function openInviteModal(conv) {
       results.replaceChildren(...found
         .filter((r) => !conv.members.some((m) => m.ref === r.ref))
         .map((r) => h('div', { class: 'member-row' },
-          avatarFor(r.username, r.kind),
+          avatarFor(r.username, r.kind, false, r.avatarRev ? { ref: r.ref, rev: r.avatarRev } : null),
           h('div', { class: 'name' }, displayName(r.ref)),
           h('button', {
             class: 'small primary',
@@ -888,6 +1487,89 @@ function viewHeader(title) {
     h('h2', {}, title));
 }
 
+// Decode an image file; createImageBitmap first, <img> fallback for formats
+// it refuses (e.g. exotic PNG flavors).
+async function decodeImage(file) {
+  try {
+    const bmp = await createImageBitmap(file);
+    return { src: bmp, w: bmp.width, h: bmp.height, close: () => bmp.close() };
+  } catch {
+    const url = URL.createObjectURL(file);
+    try {
+      const img = new Image();
+      await new Promise((resolve, reject) => {
+        img.onload = resolve;
+        img.onerror = () => reject(new Error('could not decode image'));
+        img.src = url;
+      });
+      return { src: img, w: img.naturalWidth, h: img.naturalHeight, close: () => URL.revokeObjectURL(url) };
+    } catch (e) {
+      URL.revokeObjectURL(url);
+      throw e;
+    }
+  }
+}
+
+// Center-crop + downscale an avatar to 256x256 JPEG in the browser.
+async function resizeAvatar(file) {
+  const im = await decodeImage(file);
+  const size = 256;
+  const scale = Math.max(size / im.w, size / im.h);
+  const w = Math.round(im.w * scale);
+  const hh = Math.round(im.h * scale);
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  canvas.getContext('2d').drawImage(im.src, (size - w) / 2, (size - hh) / 2, w, hh);
+  im.close();
+  return new Promise((resolve, reject) =>
+    canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('could not encode image'))), 'image/jpeg', 0.85));
+}
+
+function renderProfileCard() {
+  const fileInput = h('input', {
+    type: 'file', class: 'hidden-file', accept: 'image/*',
+    onchange: async (e) => {
+      const file = e.target.files[0];
+      e.target.value = '';
+      if (!file) return;
+      try {
+        const blob = await resizeAvatar(file);
+        const res = await api.uploadAvatar(blob);
+        state.me.avatarRev = res.avatarRev;
+        toast('avatar updated');
+        refreshConversations();
+      } catch (err) { toast(errMsg(err), true); }
+    },
+  });
+  return h('div', { class: 'card' },
+    h('h3', {}, 'Profile'),
+    h('div', { class: 'row profile-row' },
+      h('div', { class: 'avatar-big' },
+        avatarFor(state.me.username, 'user', false,
+          state.me.avatarRev ? { ref: state.me.ref, rev: state.me.avatarRev } : null)),
+      h('div', { class: 'profile-info' },
+        h('div', { class: 'profile-name' }, `@${state.me.username}`),
+        h('div', { class: 'muted' }, 'Your avatar is visible to other users. It is profile data, not an encrypted message.'),
+        h('div', { class: 'row wrap-row' },
+          fileInput,
+          h('button', { class: 'ghost', onclick: () => fileInput.click() },
+            icon('camera'), state.me.avatarRev ? ' Change avatar' : ' Set avatar'),
+          state.me.avatarRev
+            ? h('button', {
+              class: 'danger small',
+              onclick: async () => {
+                try {
+                  await api.deleteAvatar();
+                  state.me.avatarRev = 0;
+                  toast('avatar removed');
+                  refreshConversations();
+                } catch (err) { toast(errMsg(err), true); }
+              },
+            }, 'Remove')
+            : null))));
+}
+
 function renderSettings() {
   const s = state.me.settings;
   const sel = (key, label, hint) => {
@@ -919,6 +1601,7 @@ function renderSettings() {
 
   return h('div', { class: 'view' },
     viewHeader('Privacy & settings'),
+    renderProfileCard(),
     h('div', { class: 'card' },
       h('h3', {}, 'Privacy'),
       sel('whoCanDm', 'Who can send me direct messages',
@@ -1024,12 +1707,48 @@ async function handleWsEvent(ev) {
     // have been added by the optimistic send path — this was the cause of
     // own messages showing up twice.
     upsertMessage(ev.convId, { ...ev.message, ...dec });
-    if (ev.message.senderRef !== state.me.ref
-      && (ui.activeConvId !== ev.convId || ui.view !== 'chats' || document.hidden)) {
+    const active = ui.activeConvId === ev.convId && ui.view === 'chats' && !document.hidden;
+    if (ev.message.senderRef !== state.me.ref && !active) {
       ui.unread.set(ev.convId, (ui.unread.get(ev.convId) || 0) + 1);
     }
+    // keep pinned chats in place; bump the conversation to the top of the
+    // unpinned section
     const idx = state.conversations.findIndex((c) => c.id === ev.convId);
-    if (idx > 0) state.conversations.unshift(state.conversations.splice(idx, 1)[0]);
+    if (idx >= 0 && state.conversations[idx].pinOrder == null) {
+      const firstUnpinned = state.conversations.findIndex((c) => c.pinOrder == null);
+      if (idx > firstUnpinned) {
+        state.conversations.splice(firstUnpinned, 0, state.conversations.splice(idx, 1)[0]);
+      }
+    }
+    if (active) markRead(conv);
+    renderMain();
+  } else if (ev.type === 'message_edit') {
+    const conv = findConv(ev.convId);
+    if (!conv) return;
+    const list = ui.msgs.get(ev.convId);
+    if (list?.some((m) => m.id != null && String(m.id) === String(ev.message.id))) {
+      const dec = await store.decryptMessage(conv, ev.message);
+      upsertMessage(ev.convId, { ...ev.message, ...dec });
+    }
+    renderMain();
+  } else if (ev.type === 'message_delete') {
+    const list = ui.msgs.get(ev.convId);
+    if (list) {
+      const i = list.findIndex((m) => m.id != null && String(m.id) === String(ev.messageId));
+      if (i >= 0) list.splice(i, 1);
+    }
+    renderMain();
+  } else if (ev.type === 'read') {
+    const conv = findConv(ev.convId);
+    if (conv) {
+      conv.reads = conv.reads || {};
+      conv.reads[ev.ref] = ev.lastReadId;
+      renderMain();
+    }
+  } else if (ev.type === 'conv_deleted') {
+    state.conversations = state.conversations.filter((c) => c.id !== ev.convId);
+    forgetConv(ev.convId);
+    if (ui.modal) ui.modal = null;
     renderMain();
   } else if (ev.type === 'conv') {
     await refreshConversations();
@@ -1052,14 +1771,43 @@ async function handleWsEvent(ev) {
   }
 }
 
+let listenersInstalled = false;
+
 async function enterApp() {
   onWsEvent(handleWsEvent);
   connectWs();
+  if (!listenersInstalled) {
+    listenersInstalled = true;
+    // coming back to the tab marks the open chat as read
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState !== 'visible') return;
+      const conv = findConv(ui.activeConvId);
+      if (conv) { markRead(conv); renderMain(); }
+    });
+  }
   await refreshConversations();
   render();
 }
 
 // ------------------------------------------------------------------ boot
+
+// Installed-PWA keyboard fix: when the on-screen keyboard overlays the page
+// instead of resizing it (Chrome standalone mode), shrink the app to the
+// visual viewport so the composer stays visible above the keyboard.
+if (window.visualViewport) {
+  const vv = window.visualViewport;
+  const sync = () => {
+    const keyboard = vv.scale === 1 && window.innerHeight - vv.height > 80;
+    if (keyboard) {
+      document.documentElement.style.setProperty('--app-h', `${Math.round(vv.height)}px`);
+      window.scrollTo(0, 0);
+    } else {
+      document.documentElement.style.removeProperty('--app-h');
+    }
+  };
+  vv.addEventListener('resize', sync);
+  vv.addEventListener('scroll', sync);
+}
 
 (async () => {
   if (!hasToken()) return render();

@@ -50,6 +50,14 @@ export const api = {
   messages: (id, beforeId) =>
     call('GET', `/conversations/${id}/messages?limit=50${beforeId ? `&beforeId=${beforeId}` : ''}`),
   sendMessage: (id, m) => call('POST', `/conversations/${id}/messages`, m),
+  editMessage: (id, mid, m) => call('PUT', `/conversations/${id}/messages/${mid}`, m),
+  deleteMessage: (id, mid) => call('DELETE', `/conversations/${id}/messages/${mid}`),
+  markRead: (id, lastReadId) => call('POST', `/conversations/${id}/read`, { lastReadId }),
+  deleteConversation: (id) => call('DELETE', `/conversations/${id}`),
+  savePins: (order) => call('PUT', '/me/pins', { order }),
+  deleteAvatar: () => call('DELETE', '/me/avatar'),
+  uploadAvatar,
+  fetchAvatar,
   addMember: (id, b) => call('POST', `/conversations/${id}/members`, b),
   removeMember: (id, ref) => call('DELETE', `/conversations/${id}/members/${encodeURIComponent(ref)}`),
   rotate: (id, b) => call('POST', `/conversations/${id}/rotate`, b),
@@ -93,6 +101,30 @@ async function fetchBlob(blobId) {
     throw new ApiError(res.status, data?.error || `http ${res.status}`);
   }
   return new Uint8Array(await res.arrayBuffer());
+}
+
+async function uploadAvatar(blob) {
+  const res = await fetch('/api/me/avatar', {
+    method: 'PUT',
+    headers: {
+      'content-type': blob.type || 'image/jpeg',
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+    },
+    body: blob,
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) throw new ApiError(res.status, data?.error || `http ${res.status}`);
+  return data;
+}
+
+// Avatars are plain profile images behind session auth, so <img src> can't
+// load them directly — fetch with the bearer token and hand back a Blob.
+async function fetchAvatar(ref, rev) {
+  const res = await fetch(`/api/avatars/${encodeURIComponent(ref)}?v=${rev}`, {
+    headers: token ? { authorization: `Bearer ${token}` } : {},
+  });
+  if (!res.ok) throw new ApiError(res.status, 'no avatar');
+  return res.blob();
 }
 
 // ------------------------------------------------------------- websocket

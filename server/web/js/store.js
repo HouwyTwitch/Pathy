@@ -223,13 +223,43 @@ export function sendText(conv, text) {
   return sendBody(conv, { t: 'text', text, ts: Date.now() });
 }
 
+export function sendSticker(conv, emoji) {
+  return sendBody(conv, { t: 'sticker', emoji, ts: Date.now() });
+}
+
+// Re-encrypt the edited text under the current conversation key and replace
+// the message ciphertext server-side (sender-only, enforced by the server).
+export async function editText(conv, msgId, text) {
+  const doSend = async () => {
+    const key = await getConvKey(conv, conv.keyVersion);
+    if (!key) throw new Error('no conversation key');
+    const m = C.encryptMessage(key, conv.id, conv.keyVersion, state.me.ref, state.keys, {
+      t: 'text', text, ts: Date.now(),
+    });
+    return api.editMessage(conv.id, msgId, m);
+  };
+  try {
+    return await doSend();
+  } catch (err) {
+    if (err.status === 409) {
+      const fresh = await api.conversation(conv.id);
+      conv.keyVersion = fresh.conversation.keyVersion;
+      await loadConvKeys(conv);
+      return doSend();
+    }
+    throw err;
+  }
+}
+
 // ----------------------------------------------------------- attachments
 
 export const MAX_FILE_BYTES = 64 * 1024 * 1024;
 
 // Encrypt a File/Blob with a one-off key, upload the ciphertext, then send
 // a message whose (E2E-encrypted) body carries the blob reference + key.
-export async function sendFile(conv, file, onProgress) {
+// `extra` merges additional metadata into the body (image dimensions,
+// voice-note kind/duration, …).
+export async function sendFile(conv, file, onProgress, extra = {}) {
   if (file.size > MAX_FILE_BYTES) throw new Error('file is too large (max 64 MB)');
   if (file.size === 0) throw new Error('cannot send an empty file');
   const bytes = new Uint8Array(await file.arrayBuffer());
@@ -244,6 +274,7 @@ export async function sendFile(conv, file, onProgress) {
     blobId,
     k: C.toB64(blobKey),
     n,
+    ...extra,
     ts: Date.now(),
   };
   const sent = await sendBody(conv, body);
