@@ -126,6 +126,96 @@ function addLongPress(el, fn) {
   });
 }
 
+// ------------------------------------------------------------ notifications
+
+let swReg = null; // service worker registration (notifications on Android PWA)
+const liveNotifs = new Map(); // convId -> [Notification] (page-created ones)
+
+// Preference lives on this device. Default: on, once the browser permission
+// has been granted (granting happens via the Settings toggle).
+function notifyEnabled() {
+  const v = localStorage.getItem('pathy.notify');
+  if (v === 'off') return false;
+  return typeof Notification !== 'undefined' && Notification.permission === 'granted';
+}
+
+function notifBody(m) {
+  if (m.error) return 'New message';
+  const b = m.body || {};
+  if (b.t === 'sticker') return `Sticker ${b.emoji || ''}`;
+  if (b.t === 'file') {
+    if (b.kind === 'voice') return 'Voice message';
+    return (b.mime || '').startsWith('image/') ? 'Photo' : (b.name || 'File');
+  }
+  return String(b.text || '').slice(0, 140);
+}
+
+// Local notification while the app is open but in the background (a hidden
+// tab, an unfocused window). When the app is fully closed, the server-side
+// Web Push wakes the service worker instead (see sw.js).
+function notifyNewMessage(conv, m) {
+  if (!notifyEnabled()) return;
+  if (document.hasFocus() && !document.hidden) return;
+  const sender = displayName(m.senderRef);
+  const title = conv.type === 'dm' ? sender : `${sender} — ${convTitle(conv)}`;
+  const opts = {
+    body: notifBody(m),
+    tag: `pathy-${conv.id}`,
+    icon: '/icon.svg',
+    data: { convId: conv.id },
+  };
+  try {
+    const n = new Notification(title, opts);
+    n.onclick = () => {
+      try { window.focus(); } catch { /* mobile */ }
+      openConv(conv.id);
+      n.close();
+    };
+    if (!liveNotifs.has(conv.id)) liveNotifs.set(conv.id, []);
+    liveNotifs.get(conv.id).push(n);
+  } catch {
+    // Android: page-created Notification is forbidden — go through the SW
+    swReg?.showNotification?.(title, { ...opts, badge: '/icon.svg' }).catch(() => {});
+  }
+}
+
+function clearNotifications(convId) {
+  for (const n of liveNotifs.get(convId) || []) { try { n.close(); } catch { /* gone */ } }
+  liveNotifs.delete(convId);
+  swReg?.getNotifications?.({ tag: `pathy-${convId}` })
+    .then((list) => list.forEach((n) => n.close()))
+    .catch(() => {});
+}
+
+const b64uToBytes = (s) => {
+  const b64 = s.replaceAll('-', '+').replaceAll('_', '/');
+  return Uint8Array.from(atob(b64 + '='.repeat((4 - (b64.length % 4)) % 4)), (c) => c.charCodeAt(0));
+};
+
+// Keep the Web Push subscription in sync with the preference. With push,
+// notifications reach the device even when the (installed) app is closed.
+async function syncPushSubscription(enable) {
+  try {
+    if (!swReg?.pushManager) return;
+    const existing = await swReg.pushManager.getSubscription();
+    if (!enable) {
+      if (existing) {
+        api.deletePushSub(existing.endpoint).catch(() => {});
+        await existing.unsubscribe();
+      }
+      return;
+    }
+    const { key } = await api.vapidKey();
+    if (!key) return;
+    const sub = existing || await swReg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: b64uToBytes(key),
+    });
+    const j = sub.toJSON();
+    await api.savePushSub({ endpoint: j.endpoint, keys: j.keys });
+  } catch { /* push unsupported (no push service, permission revoked, …) */ }
+}
+
 // ---------------------------------------------------------------- avatars
 
 const avatarCache = new Map(); // `${ref}:${rev}` -> { url } | { loading } | { missing }
@@ -624,6 +714,7 @@ function renderSidebarBottom() {
     h('button', {
       class: 'icon-btn', title: 'Log out', 'aria-label': 'Log out',
       onclick: async () => {
+        await syncPushSubscription(false); // this device stops getting pushes
         await store.logout();
         disconnectWs();
         for (const c of [avatarCache, mediaCache, audioCache]) c.clear();
@@ -645,6 +736,7 @@ async function openConv(id) {
   ui.activeConvId = id;
   ui.unread.delete(id);
   ui.picker = null;
+  clearNotifications(id);
   renderMain();
   const conv = findConv(id);
   if (!conv) return;
@@ -1599,9 +1691,45 @@ function renderSettings() {
     }),
     h('div', {}, h('div', {}, label), h('div', { class: 'muted' }, hint)));
 
+  const notifToggle = h('input', {
+    type: 'checkbox', class: 'cb', ...(notifyEnabled() ? { checked: true } : {}),
+    onchange: async (e) => {
+      if (e.target.checked) {
+        if (typeof Notification === 'undefined') {
+          toast('notifications are not supported in this browser', true);
+          e.target.checked = false;
+          return;
+        }
+        let perm = Notification.permission;
+        if (perm === 'default') perm = await Notification.requestPermission();
+        if (perm !== 'granted') {
+          toast('notifications are blocked — allow them in your browser settings', true);
+          e.target.checked = false;
+          return;
+        }
+        localStorage.setItem('pathy.notify', 'on');
+        syncPushSubscription(true);
+        toast('notifications enabled');
+      } else {
+        localStorage.setItem('pathy.notify', 'off');
+        syncPushSubscription(false);
+        toast('notifications disabled');
+      }
+    },
+  });
+
   return h('div', { class: 'view' },
     viewHeader('Privacy & settings'),
     renderProfileCard(),
+    h('div', { class: 'card' },
+      h('h3', {}, 'Notifications'),
+      h('label', { class: 'field row switch-row' },
+        notifToggle,
+        h('div', {},
+          h('div', {}, 'Notify about new messages'),
+          h('div', { class: 'muted' },
+            'System notifications when a message arrives while Pathy is in the background. ',
+            'On the installed app they arrive even when Pathy is closed (push carries no message content — only who wrote).')))),
     h('div', { class: 'card' },
       h('h3', {}, 'Privacy'),
       sel('whoCanDm', 'Who can send me direct messages',
@@ -1711,6 +1839,9 @@ async function handleWsEvent(ev) {
     if (ev.message.senderRef !== state.me.ref && !active) {
       ui.unread.set(ev.convId, (ui.unread.get(ev.convId) || 0) + 1);
     }
+    if (ev.message.senderRef !== state.me.ref) {
+      notifyNewMessage(conv, { ...ev.message, ...dec });
+    }
     // keep pinned chats in place; bump the conversation to the top of the
     // unpinned section
     const idx = state.conversations.findIndex((c) => c.id === ev.convId);
@@ -1785,11 +1916,26 @@ async function enterApp() {
       if (conv) { markRead(conv); renderMain(); }
     });
   }
+  syncPushSubscription(notifyEnabled()); // keep this device's push sub fresh
   await refreshConversations();
   render();
 }
 
 // ------------------------------------------------------------------ boot
+
+// Service worker: notifications for the installed app (Android requires
+// SW-shown notifications) and Web Push while Pathy is closed.
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js')
+    .then((reg) => { swReg = reg; })
+    .catch(() => { /* http without localhost, or SW disabled */ });
+  navigator.serviceWorker.addEventListener('message', (e) => {
+    if (e.data?.type === 'open-conv' && e.data.convId != null && state.me) {
+      const id = state.conversations.find((c) => String(c.id) === String(e.data.convId))?.id;
+      if (id != null) openConv(id);
+    }
+  });
+}
 
 // Installed-PWA keyboard fix: when the on-screen keyboard overlays the page
 // instead of resizing it (Chrome standalone mode), shrink the app to the

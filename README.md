@@ -20,6 +20,10 @@ secret keys never leave the client.
 - **Telegram-style messaging UX** — read receipts (✓ → ✓✓), edit & delete
   messages (delete destroys the ciphertext server-side), emoji picker and
   stickers, avatars, pinned & reorderable chats, chat deletion.
+- **Notifications** — system notifications for new messages, including Web
+  Push to the installed (Android) app while it is closed. Pushes carry only
+  metadata the server already has (who wrote, in which chat) — never message
+  content, which the server cannot read anyway.
 - **Modern, minimal UI** — light & dark themes, and full mobile support:
   single-pane navigation on phones, safe-area aware, installable (web
   manifest with on-screen-keyboard handling).

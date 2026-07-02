@@ -118,6 +118,25 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_mime TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_rev  INT NOT NULL DEFAULT 0;
 -- Per-user pinned-chat ordering (NULL = not pinned; ascending = top first).
 ALTER TABLE members ADD COLUMN IF NOT EXISTS pin_order DOUBLE PRECISION;
+
+-- Web Push: server VAPID keypair (generated once) + per-device subscriptions.
+-- Pushes carry only metadata the server already knows (conv id, sender ref) —
+-- never message content, which the server does not have.
+CREATE TABLE IF NOT EXISTS vapid (
+  id          INT PRIMARY KEY CHECK (id = 1),
+  public_key  TEXT NOT NULL,
+  private_key TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS push_subs (
+  id         SERIAL PRIMARY KEY,
+  user_id    INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  endpoint   TEXT NOT NULL UNIQUE,
+  p256dh     TEXT NOT NULL,
+  auth       TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS push_subs_user_idx ON push_subs(user_id);
 `;
 
 export const pool = new pg.Pool({

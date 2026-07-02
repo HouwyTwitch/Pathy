@@ -70,7 +70,7 @@ botapi.get('/conversations', asyncRoute(async (req, res) => {
 
 async function requireBotMembership(convId, ref) {
   if (!Number.isInteger(convId) || convId < 1) throw new HttpError(400, 'bad conversation id');
-  const conv = await q('SELECT id, type, key_version FROM conversations WHERE id = $1', [convId]);
+  const conv = await q('SELECT id, type, name, key_version FROM conversations WHERE id = $1', [convId]);
   if (!conv.rows[0]) throw new HttpError(404, 'conversation not found');
   const membership = await memberOf(convId, ref);
   if (!membership) throw new HttpError(403, 'bot is not a member');
@@ -170,6 +170,8 @@ botapi.post('/sendMessage', asyncRoute(async (req, res) => {
     id: r.rows[0].id, convId: conv.id, senderRef: req.bot.ref, keyVersion: m.keyVersion,
     n: m.n, ct: m.ct, sig: m.sig, ts: r.rows[0].ts,
   };
-  await deliverToConversation(conv.id, { type: 'message', convId: conv.id, convType: conv.type, message });
+  await deliverToConversation(conv.id, {
+    type: 'message', convId: conv.id, convType: conv.type, convName: conv.name, message,
+  });
   res.status(201).json({ id: message.id, ts: message.ts });
 }));

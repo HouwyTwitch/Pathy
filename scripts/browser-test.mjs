@@ -290,6 +290,44 @@ await wendy.page.locator('.action-item', { hasText: 'Delete for everyone' }).cli
 await wendyItem(`pins-test-${run}`).waitFor({ state: 'detached', timeout: 15000 });
 log('chat deleted (conversation removed server-side)');
 
+// notifications: a backgrounded client shows a system notification with the
+// decrypted preview when a message arrives (stubbed Notification API)
+const noraCtx = await browser.newContext({ permissions: ['notifications'] });
+await noraCtx.addInitScript(() => {
+  window.__notifs = [];
+  function FakeNotification(title, opts) {
+    window.__notifs.push({ title, body: opts?.body });
+    this.close = () => {};
+  }
+  FakeNotification.permission = 'granted';
+  FakeNotification.requestPermission = async () => 'granted';
+  window.Notification = FakeNotification;
+  document.hasFocus = () => false; // pretend the window is in the background
+});
+const noraPage = await noraCtx.newPage();
+noraPage.on('pageerror', (e) => console.error('[nora] pageerror:', e.message));
+await noraPage.goto(BASE);
+await noraPage.getByRole('button', { name: 'Register' }).click();
+await noraPage.getByPlaceholder('username').fill(`nora_${run}`);
+await noraPage.getByPlaceholder('password').fill(`browser-pass-${run}!`);
+await noraPage.getByRole('button', { name: 'Create account' }).click();
+await noraPage.locator('.sidebar').waitFor({ timeout: 30000 });
+assert.ok(
+  await noraPage.evaluate(() => navigator.serviceWorker.getRegistration().then((r) => !!r)),
+  'service worker registered (needed for installed-app notifications)',
+);
+await wendy.page.locator('.sidebar-top input').fill(`nora_${run}`.slice(0, 6));
+await wendy.page.locator('.search-hit').first().click();
+await wendy.page.locator('.chat-header').waitFor({ timeout: 15000 });
+await wendy.page.locator('.composer-input').fill('пссс, notification test');
+await wendy.page.locator('.composer-input').press('Enter');
+await noraPage.waitForFunction(() => window.__notifs.length > 0, null, { timeout: 15000 });
+const notif = await noraPage.evaluate(() => window.__notifs[0]);
+assert.match(notif.title, new RegExp(`wendy_${run}`), 'notification names the sender');
+assert.match(notif.body, /notification test/, 'notification shows the decrypted preview');
+await noraCtx.close();
+log('new-message notification fired for a backgrounded client (SW registered for push)');
+
 // mobile: phone-sized viewport gets single-pane navigation with a back button
 const mia = await newUser('mia', {
   viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true,

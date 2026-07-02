@@ -5,6 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { initDb, pool } from './db.js';
+import { initPush } from './push.js';
 import { HttpError } from './util.js';
 import { api } from './routes/api.js';
 import { botapi } from './routes/botapi.js';
@@ -30,7 +31,7 @@ app.use((req, res, next) => {
   res.set({
     'Content-Security-Policy':
       `default-src 'none'; script-src 'self' ${importMapHash}; style-src 'self'; img-src 'self' data: blob:; `
-      + "media-src 'self' blob:; connect-src 'self' ws: wss:; manifest-src 'self'; "
+      + "media-src 'self' blob:; connect-src 'self' ws: wss:; manifest-src 'self'; worker-src 'self'; "
       + "base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
@@ -82,6 +83,7 @@ app.use((err, req, res, next) => {
 const port = Number(process.env.PORT) || 8080;
 
 await initDb();
+await initPush();
 const server = http.createServer(app);
 attachWs(server);
 server.listen(port, () => console.log(`pathy server listening on :${port}`));

@@ -10,6 +10,7 @@ import { requireSession } from '../auth.js';
 import { rateLimit } from '../ratelimit.js';
 import { deliver, deliverToConversation } from '../events.js';
 import { isOnline } from '../ws.js';
+import { vapidPublicKey } from '../push.js';
 
 export const api = Router();
 
@@ -119,8 +120,37 @@ api.post('/login', authLimiter, asyncRoute(async (req, res) => {
   });
 }));
 
+// VAPID public key is not secret — needed before subscribing to push.
+api.get('/push/vapid', (req, res) => res.json({ key: vapidPublicKey() }));
+
 api.use(requireSession);
 api.use(rateLimit({ windowMs: 60_000, max: 600, keyFn: (req) => req.user.ref }));
+
+// ------------------------------------------------------- push subscriptions
+
+api.post('/me/push-subscriptions', asyncRoute(async (req, res) => {
+  const { endpoint, keys } = req.body || {};
+  if (typeof endpoint !== 'string' || !/^https:\/\//.test(endpoint) || endpoint.length > 1024) {
+    throw new HttpError(400, 'bad endpoint');
+  }
+  if (!keys || !isB64u(String(keys.p256dh || '').replaceAll('=', ''), 256)
+    || !isB64u(String(keys.auth || '').replaceAll('=', ''), 64)) {
+    throw new HttpError(400, 'bad subscription keys');
+  }
+  await q(
+    `INSERT INTO push_subs (user_id, endpoint, p256dh, auth) VALUES ($1, $2, $3, $4)
+     ON CONFLICT (endpoint) DO UPDATE SET user_id = $1, p256dh = $3, auth = $4`,
+    [req.user.id, endpoint, keys.p256dh, keys.auth],
+  );
+  res.status(201).json({ ok: true });
+}));
+
+api.delete('/me/push-subscriptions', asyncRoute(async (req, res) => {
+  const { endpoint } = req.body || {};
+  if (typeof endpoint !== 'string') throw new HttpError(400, 'bad endpoint');
+  await q('DELETE FROM push_subs WHERE user_id = $1 AND endpoint = $2', [req.user.id, endpoint]);
+  res.json({ ok: true });
+}));
 
 api.post('/logout', asyncRoute(async (req, res) => {
   await q('DELETE FROM sessions WHERE id = $1', [req.user.sessionId]);
@@ -600,7 +630,9 @@ api.post('/conversations/:id/messages', messageLimiter, asyncRoute(async (req, r
     id: r.rows[0].id, convId, senderRef: me, keyVersion: m.keyVersion,
     n: m.n, ct: m.ct, sig: m.sig, ts: r.rows[0].ts,
   };
-  await deliverToConversation(convId, { type: 'message', convId, convType: conv.type, message });
+  await deliverToConversation(convId, {
+    type: 'message', convId, convType: conv.type, convName: conv.name, message,
+  });
   res.status(201).json({ id: message.id, ts: message.ts });
 }));
 
