@@ -48,7 +48,7 @@ The decrypted message body is JSON:
 |---|---|
 | `{ t: "text", text, replyTo? }` | plain text (clients render http(s) links). `replyTo: { id, sender, kind, preview }` marks a Telegram-style reply to message `id`. |
 | `{ t: "sticker", emoji }` | a legacy emoji sticker — clients render the emoji large |
-| `{ t: "sticker", sid, pack, emoji, w, h, mime }` | a pack sticker: image lives server-side, users fetch it via `GET /api/stickers/sticker/:sid/image` |
+| `{ t: "sticker", sid, pack, emoji, w, h, mime }` | a pack sticker: the asset lives server-side, users fetch it via `GET /api/stickers/sticker/:sid/image`. `mime` is `image/webp`/`image/png`/`image/jpeg`, `video/webm`, or `application/x-tgsticker` (gzipped Lottie JSON, rendered with a Lottie player). |
 | `{ t: "file", name, size, mime, blobId, k, n, … }` | v1 attachment: `blobId` points at an uploaded encrypted blob; `k`/`n` are the file key + nonce (base64url) for `decryptBlob` in [`shared/crypto.js`](../shared/crypto.js). The blob itself is XChaCha20-Poly1305 ciphertext — fetch it via `GET /blobs/:id` and decrypt locally. Extra fields: `w`/`h` (media dimensions), `kind: "voice"` + `dur` seconds (voice notes), `kind: "round"` + `dur` (round video messages). |
 | `{ t: "file", …, np, cs }` | v2 attachment (sent by web clients, up to 2 GB): the blob is a sequence of chunks of `cs` plaintext bytes (+16-byte AEAD tag each); decrypt chunk `i` of `ceil(size/cs)` with `decryptBlobChunk(k, np, i, total, ct)` from `shared/crypto.js`. |
 

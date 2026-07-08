@@ -22,9 +22,11 @@ secret keys never leave the client.
   pipeline and play back inline.
 - **Replies** — answer a specific message: the quote is pinned to your
   message, tap it to jump back. Swipe right on mobile to reply.
-- **Sticker packs** — import any Telegram sticker pack (static & video
-  stickers) by its t.me/addstickers link, or build your own packs from
-  images; tap a sticker someone sent to add its pack.
+- **Sticker packs** — import any Telegram sticker pack by its
+  t.me/addstickers link: static (webp), video (webm) **and animated (.tgs)**
+  stickers all work — .tgs render through a CSP-safe Lottie player, playing
+  only while on screen. Build your own packs from images, webm clips or
+  .tgs files; tap a sticker someone sent to add its pack.
 - **Telegram-style messaging UX** — read receipts (✓ → ✓✓), edit & delete
   messages (delete destroys the ciphertext server-side), message grouping
   with bubble tails, typing indicators, unread divider, jump-to-latest

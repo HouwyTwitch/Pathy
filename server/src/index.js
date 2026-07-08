@@ -79,6 +79,12 @@ app.use('/vendor/@noble', (req, res, next) => {
   next();
 });
 app.use('/vendor/@noble', express.static(path.join(repoRoot, 'node_modules', '@noble'), staticOpts));
+// Lottie player (animated .tgs stickers) — lazy-imported by the client.
+app.use('/vendor/lottie-web', (req, res, next) => {
+  if (!req.path.endsWith('.js')) return res.status(404).end();
+  next();
+});
+app.use('/vendor/lottie-web', express.static(path.join(repoRoot, 'node_modules', 'lottie-web'), staticOpts));
 app.use(express.static(path.join(repoRoot, 'server', 'web'), { ...staticOpts, index: 'index.html' }));
 
 app.use((req, res) => res.status(404).json({ error: 'not found' }));

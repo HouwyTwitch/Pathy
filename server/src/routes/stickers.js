@@ -11,7 +11,9 @@ import { rateLimit } from '../ratelimit.js';
 
 export const stickers = Router();
 
-const STICKER_MIMES = ['image/webp', 'image/png', 'image/jpeg', 'video/webm'];
+// application/x-tgsticker = Telegram's animated format: gzipped Lottie JSON,
+// rendered client-side with a Lottie player.
+const STICKER_MIMES = ['image/webp', 'image/png', 'image/jpeg', 'video/webm', 'application/x-tgsticker'];
 const MAX_STICKER_BYTES = 1024 * 1024;    // webm video stickers can be chunky
 const MAX_PACK_STICKERS = 120;
 const MAX_INSTALLED_PACKS = 200;
@@ -114,13 +116,16 @@ stickers.delete('/packs/:id', asyncRoute(async (req, res) => {
 stickers.post(
   '/packs/:id/stickers',
   rateLimit({ windowMs: 60_000, max: 60, keyFn: (req) => req.user.ref }),
-  raw({ type: ['image/*', 'video/webm'], limit: MAX_STICKER_BYTES }),
+  raw({ type: ['image/*', 'video/webm', 'application/x-tgsticker'], limit: MAX_STICKER_BYTES }),
   asyncRoute(async (req, res) => {
     const pack = await loadPack(Number(req.params.id));
     if (pack.owner_id !== req.user.id) throw new HttpError(403, 'only the pack owner adds stickers');
     const mime = String(req.headers['content-type'] || '').split(';')[0].trim();
-    if (!STICKER_MIMES.includes(mime)) throw new HttpError(400, 'sticker must be webp, png, jpeg or webm');
+    if (!STICKER_MIMES.includes(mime)) throw new HttpError(400, 'sticker must be webp, png, jpeg, webm or tgs');
     if (!Buffer.isBuffer(req.body) || req.body.length < 100) throw new HttpError(400, 'empty sticker');
+    if (mime === 'application/x-tgsticker' && !(req.body[0] === 0x1f && req.body[1] === 0x8b)) {
+      throw new HttpError(400, 'tgs sticker must be gzipped Lottie JSON');
+    }
     const count = await q('SELECT count(*)::int AS n FROM stickers WHERE pack_id = $1', [pack.id]);
     if (count.rows[0].n >= MAX_PACK_STICKERS) throw new HttpError(400, `pack is full (max ${MAX_PACK_STICKERS})`);
     const emoji = String(req.query.emoji || '').slice(0, 16) || null;
@@ -210,12 +215,8 @@ stickers.post(
     }
 
     const set = await tg(token, 'getStickerSet', { name });
-    const usable = (set.stickers || [])
-      .filter((s) => !s.is_animated) // .tgs (Lottie) has no web-native renderer
-      .slice(0, MAX_PACK_STICKERS);
-    if (usable.length === 0) {
-      throw new HttpError(400, 'this pack has only animated (.tgs) stickers, which cannot be imported');
-    }
+    const usable = (set.stickers || []).slice(0, MAX_PACK_STICKERS);
+    if (usable.length === 0) throw new HttpError(400, 'this pack is empty');
 
     // Download with limited concurrency; skip oversized/broken files.
     const files = new Array(usable.length).fill(null);
@@ -237,7 +238,8 @@ stickers.post(
           if (buf.length < 100 || buf.length > MAX_STICKER_BYTES) continue;
           files[i] = {
             emoji: s.emoji || null,
-            mime: s.is_video ? 'video/webm' : 'image/webp',
+            mime: s.is_video ? 'video/webm'
+              : (s.is_animated ? 'application/x-tgsticker' : 'image/webp'),
             w: s.width || null,
             h: s.height || null,
             data: buf,

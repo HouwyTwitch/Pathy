@@ -134,6 +134,72 @@ await rex.page.getByRole('button', { name: 'Add stickers' }).click();
 await rex.page.locator('.toast', { hasText: 'added to your stickers' }).waitFor({ timeout: 10000 });
 log('custom sticker pack: created, sticker uploaded, sent, installed by the receiver');
 
+// --- animated .tgs sticker: upload to the pack, send, verify Lottie plays
+const { gzipSync } = await import('node:zlib');
+const lottieJson = {
+  v: '5.7.4', fr: 30, ip: 0, op: 60, w: 512, h: 512, nm: 'spin', ddd: 0, assets: [],
+  layers: [{
+    ddd: 0, ind: 1, ty: 4, nm: 'sq', sr: 1,
+    ks: {
+      o: { a: 0, k: 100 },
+      r: { a: 1, k: [{ i: { x: [0.5], y: [0.5] }, o: { x: [0.5], y: [0.5] }, t: 0, s: [0] }, { t: 60, s: [360] }] },
+      p: { a: 0, k: [256, 256, 0] }, a: { a: 0, k: [0, 0, 0] }, s: { a: 0, k: [100, 100, 100] },
+    },
+    ao: 0,
+    shapes: [{
+      ty: 'gr',
+      it: [
+        { ty: 'rc', d: 1, s: { a: 0, k: [240, 240] }, p: { a: 0, k: [0, 0] }, r: { a: 0, k: 40 } },
+        { ty: 'fl', c: { a: 0, k: [0.2, 0.56, 0.93, 1] }, o: { a: 0, k: 100 }, r: 1 },
+        { ty: 'tr', p: { a: 0, k: [0, 0] }, a: { a: 0, k: [0, 0] }, s: { a: 0, k: [100, 100] }, r: { a: 0, k: 0 }, o: { a: 0, k: 100 } },
+      ],
+      nm: 'g',
+    }],
+    ip: 0, op: 60, st: 0, bm: 0,
+  }],
+};
+const tgs = gzipSync(Buffer.from(JSON.stringify(lottieJson)));
+// add it to "My test pack" via the manager
+if (!(await kim.page.locator('.picker').isVisible())) {
+  await kim.page.locator('button[title="Emoji & stickers"]').click();
+}
+await kim.page.locator('.picker-tab', { hasText: 'Stickers' }).click();
+await kim.page.locator('button[title="Manage sticker packs"]').click();
+await kim.page.locator('.member-row', { hasText: 'My test pack' })
+  .getByRole('button', { name: 'Edit' }).click();
+await kim.page.locator('.modal', { hasText: 'My test pack' }).waitFor({ timeout: 10000 });
+await kim.page.locator('.modal .hidden-file').setInputFiles({
+  name: 'spin.tgs', mimeType: 'application/x-tgsticker', buffer: tgs,
+});
+await kim.page.waitForFunction(
+  () => document.querySelectorAll('.modal .sticker-cell.edit').length >= 2,
+  null, { timeout: 20000 },
+);
+// the animated one renders as a live canvas even inside the editor
+await kim.page.locator('.modal .tgs canvas').waitFor({ timeout: 20000 });
+await kim.page.getByRole('button', { name: 'Done' }).click();
+// send it
+if (!(await kim.page.locator('.picker').isVisible())) {
+  await kim.page.locator('button[title="Emoji & stickers"]').click();
+}
+await kim.page.locator('.picker-tab', { hasText: 'Stickers' }).click();
+await kim.page.locator('.pack-btn').last().click();
+await kim.page.locator('.picker .sticker-cell', { has: kim.page.locator('.tgs') }).first().click();
+await kim.page.locator('.msg.out .sticker-img-big.tgs canvas').waitFor({ timeout: 20000 });
+// receiver gets a playing Lottie animation (frame counter advances)
+const rexTgs = rex.page.locator('.msg .sticker-img-big.tgs canvas');
+await rexTgs.waitFor({ timeout: 20000 });
+await rex.page.locator('.messages').evaluate((el) => { el.scrollTop = el.scrollHeight; });
+await rex.page.waitForFunction(() => {
+  const el = document.querySelector('.msg .sticker-img-big.tgs');
+  return el && el._tgsAnim && el._tgsAnim.currentFrame > 0;
+}, null, { timeout: 15000 });
+const f1 = await rex.page.evaluate(() => document.querySelector('.msg .sticker-img-big.tgs')._tgsAnim.currentFrame);
+await rex.page.waitForTimeout(400);
+const f2 = await rex.page.evaluate(() => document.querySelector('.msg .sticker-img-big.tgs')._tgsAnim.currentFrame);
+assert.notEqual(f1, f2, `animation frames advance (${f1} → ${f2})`);
+log('animated .tgs sticker: uploaded, sent, Lottie plays on the receiver');
+
 // --- image aspect ratio: send a wide image, bubble must hug it
 const widePng = await kim.page.evaluate(async () => {
   const c = document.createElement('canvas');

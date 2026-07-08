@@ -1584,9 +1584,92 @@ function loadStickerPacks(force = false) {
   }).catch(() => { stickerPacksLoading = false; });
 }
 
-// Render one sticker (webp/png image or webm video) with lazy auth'd fetch.
-function stickerEl(st, cls) {
+// ---- animated .tgs stickers (Telegram format: gzipped Lottie JSON)
+
+let lottieMod = null; // lazily imported — ~420 KB, only loaded when needed
+const getLottie = () => {
+  if (!lottieMod) lottieMod = import('lottie-web').then((m) => m.default || m);
+  return lottieMod;
+};
+
+async function gunzip(bytes) {
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return new Response(stream).arrayBuffer();
+}
+
+const tgsDataCache = new Map(); // sid -> Promise<lottie animation JSON>
+function tgsData(sid) {
+  let p = tgsDataCache.get(sid);
+  if (!p) {
+    p = api.fetchSticker(sid)
+      .then(async (blob) => JSON.parse(new TextDecoder().decode(await gunzip(await blob.arrayBuffer()))));
+    tgsDataCache.set(sid, p);
+    p.catch(() => tgsDataCache.delete(sid));
+  }
+  return p;
+}
+
+// Rendered .tgs elements are cached and reused across re-renders (building a
+// Lottie instance is expensive), and played only while visible on screen.
+const tgsElCache = new Map(); // "<ctx>:<sid>" -> { el, anim }
+let tgsObserver = null;
+function ensureTgsObserver() {
+  if (!tgsObserver) {
+    tgsObserver = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        const anim = e.target._tgsAnim;
+        if (!anim) continue;
+        try {
+          if (e.isIntersecting) { anim.play(); anim.resize(); } else anim.pause();
+        } catch { /* renderer got torn down mid-flight */ }
+      }
+    });
+  }
+  return tgsObserver;
+}
+
+function tgsSticker(st, cls, ctx) {
   const sid = st.sid ?? st.id;
+  const key = `${ctx}:${sid}`;
+  const hit = tgsElCache.get(key);
+  if (hit) return hit.el;
+  const el = h('div', { class: `${cls} tgs`, role: 'img', 'aria-label': st.emoji || 'animated sticker' });
+  if (st.w && st.h) el.style.aspectRatio = `${st.w} / ${st.h}`;
+  const entry = { el, anim: null };
+  tgsElCache.set(key, entry);
+  if (tgsElCache.size > 80) { // cap CPU/memory: drop the oldest instance
+    const [oldKey, old] = tgsElCache.entries().next().value;
+    old.anim?.destroy();
+    if (old.el._tgsAnim) tgsObserver?.unobserve(old.el);
+    tgsElCache.delete(oldKey);
+  }
+  if (typeof DecompressionStream === 'undefined') {
+    el.textContent = st.emoji || '🎞';
+    return el;
+  }
+  Promise.all([getLottie(), tgsData(sid)]).then(([lottie, data]) => {
+    if (!tgsElCache.has(key)) return; // evicted while loading
+    entry.anim = lottie.loadAnimation({
+      container: el,
+      renderer: 'canvas',
+      loop: true,
+      autoplay: false, // the observer starts it once visible
+      animationData: structuredClone(data), // lottie mutates its input
+      rendererSettings: { clearCanvas: true, dpr: Math.min(window.devicePixelRatio || 1, 2) },
+    });
+    el._tgsAnim = entry.anim;
+    if (el.isConnected) entry.anim.play(); // observer pauses it if off-screen
+    ensureTgsObserver().observe(el);
+  }).catch(() => { el.textContent = st.emoji || '⚠'; });
+  return el;
+}
+
+// Render one sticker (webp/png image, webm video, or animated tgs) with a
+// lazy authenticated fetch. `ctx` namespaces the tgs element cache so the
+// same sticker can live in the picker and in several messages at once.
+function stickerEl(st, cls, ctx = 'x') {
+  const sid = st.sid ?? st.id;
+  if ((st.mime || '') === 'application/x-tgsticker') return tgsSticker(st, cls, ctx);
   const url = cachedImage(`st:${sid}`, () => api.fetchSticker(sid));
   if (!url) return h('div', { class: `${cls} sticker-loading` });
   if ((st.mime || '') === 'video/webm') {
@@ -1658,7 +1741,7 @@ function openStickerManageModal() {
   }, 'Create');
 
   const rows = (stickerPacks || []).map((p) => h('div', { class: 'member-row' },
-    p.stickers?.[0] ? stickerEl(p.stickers[0], 'pack-thumb') : h('div', { class: 'pack-thumb' }, '🙂'),
+    p.stickers?.[0] ? stickerEl(p.stickers[0], 'pack-thumb', 'mng') : h('div', { class: 'pack-thumb' }, '🙂'),
     h('div', { class: 'name' }, p.title, ' ',
       h('span', { class: 'muted' }, `${p.stickers?.length ?? 0} stickers`)),
     p.mine ? h('button', { class: 'small ghost', onclick: () => openPackEditModal(p.id) }, 'Edit') : null,
@@ -1678,7 +1761,7 @@ function openStickerManageModal() {
     h('div', { class: 'field' },
       h('label', {}, 'Import a Telegram pack'),
       h('div', { class: 'row' }, tgInput, tgBtn),
-      h('div', { class: 'muted' }, 'Paste a t.me/addstickers link. Static and video stickers are imported; animated (.tgs) are skipped.')),
+      h('div', { class: 'muted' }, 'Paste a t.me/addstickers link. Static, video and animated (.tgs) stickers are all supported.')),
     h('div', { class: 'field' },
       h('label', {}, 'Create your own pack'),
       h('div', { class: 'row' }, newTitle, createBtn)),
@@ -1696,15 +1779,32 @@ async function openPackEditModal(packId) {
   const err = h('div', { class: 'error-text' });
   const emojiInput = h('input', { class: 'emoji-tag', placeholder: '🙂', maxlength: '8', 'data-fid': 'st-emoji' });
   const fileInput = h('input', {
-    type: 'file', class: 'hidden-file', accept: 'image/*', multiple: '',
+    type: 'file', class: 'hidden-file', accept: 'image/*,video/webm,.tgs', multiple: '',
     onchange: async (e) => {
       const files = [...e.target.files];
       e.target.value = '';
       err.textContent = '';
       for (const f of files) {
         try {
-          const { blob, w, h: hh } = await stickerBlobFromImage(f);
-          await api.uploadSticker(pack.id, blob, { emoji: emojiInput.value.trim(), w, h: hh });
+          const emoji = emojiInput.value.trim();
+          if ((f.name || '').toLowerCase().endsWith('.tgs') || f.type === 'application/x-tgsticker') {
+            // Telegram animated sticker: gzipped Lottie JSON — validate and
+            // read the canvas size client-side before uploading as-is.
+            if (typeof DecompressionStream === 'undefined') {
+              throw new Error('this browser cannot read .tgs files');
+            }
+            const bytes = await f.arrayBuffer();
+            const data = JSON.parse(new TextDecoder().decode(await gunzip(bytes)));
+            await api.uploadSticker(pack.id,
+              new Blob([bytes], { type: 'application/x-tgsticker' }),
+              { emoji, w: data.w || 512, h: data.h || 512 });
+          } else if (f.type === 'video/webm') {
+            const meta = await videoMeta(f);
+            await api.uploadSticker(pack.id, f, { emoji, w: meta?.w, h: meta?.h });
+          } else {
+            const { blob, w, h: hh } = await stickerBlobFromImage(f);
+            await api.uploadSticker(pack.id, blob, { emoji, w, h: hh });
+          }
         } catch (ee) { err.textContent = errMsg(ee); }
       }
       loadStickerPacks(true);
@@ -1713,7 +1813,7 @@ async function openPackEditModal(packId) {
   });
   const grid = h('div', { class: 'sticker-grid' },
     pack.stickers.map((st) => h('div', { class: 'sticker-cell edit' },
-      stickerEl(st, 'sticker-img'),
+      stickerEl(st, 'sticker-img', 'edit'),
       h('button', {
         class: 'sticker-del', title: 'Remove sticker', 'aria-label': 'Remove sticker',
         onclick: async () => {
@@ -1732,7 +1832,7 @@ async function openPackEditModal(packId) {
       fileInput,
       h('div', { class: 'row' },
         emojiInput,
-        h('button', { class: 'ghost', onclick: () => fileInput.click() }, icon('plus'), ' Add images')),
+        h('button', { class: 'ghost', onclick: () => fileInput.click() }, icon('plus'), ' Add stickers')),
       h('button', { class: 'primary', onclick: closeModal }, 'Done')));
   renderMain();
 }
@@ -1745,7 +1845,7 @@ async function openStickerPackModal(packId) {
   } catch (e) { return toast(errMsg(e), true); }
   ui.modal = modal(pack.title,
     h('div', { class: 'sticker-grid' },
-      pack.stickers.map((st) => h('div', { class: 'sticker-cell' }, stickerEl(st, 'sticker-img')))),
+      pack.stickers.map((st) => h('div', { class: 'sticker-cell' }, stickerEl(st, 'sticker-img', 'pack')))),
     h('div', { class: 'actions' },
       h('button', { class: 'ghost', onclick: closeModal }, 'Close'),
       pack.installed
@@ -1804,7 +1904,7 @@ function buildPicker() {
         class: `pack-btn${p === cur ? ' active' : ''}`,
         title: p.title, 'aria-label': p.title,
         onclick: () => { ui.stickerPack = i; pickerCache = null; renderMain(); },
-      }, p.builtin ? '🙂' : (p.stickers?.[0] ? stickerEl(p.stickers[0], 'pack-thumb') : '?'))),
+      }, p.builtin ? '🙂' : (p.stickers?.[0] ? stickerEl(p.stickers[0], 'pack-thumb', 'bar') : '?'))),
       h('div', { class: 'spacer' }),
       h('button', {
         class: 'icon-btn', title: 'Manage sticker packs', 'aria-label': 'Manage sticker packs',
@@ -1832,7 +1932,7 @@ function buildPicker() {
               });
             }
           },
-        }, stickerEl(st, 'sticker-img'))));
+        }, stickerEl(st, 'sticker-img', 'pick'))));
     body = h('div', { class: 'picker-body stickers' }, grid);
     return h('div', { class: 'picker' }, head, packBar, body);
   }
@@ -1937,7 +2037,7 @@ function buildMessagesBox(conv) {
         ? h('div', {
           class: 'sticker-msg',
           onclick: () => { if (!ui.select && m.body.pack) openStickerPackModal(m.body.pack); },
-        }, stickerEl({ ...m.body, id: m.body.sid }, 'sticker-img-big'))
+        }, stickerEl({ ...m.body, id: m.body.sid }, 'sticker-img-big', `msg:${m.id ?? m.localId}`))
         : h('div', { class: 'sticker-emoji' }, m.body.emoji || '');
     } else if (m.body?.t === 'file') content = fileBubbleContent(m);
     else content = h('span', { class: 'text' }, linkify(m.body?.text ?? ''));
