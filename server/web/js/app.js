@@ -2,7 +2,7 @@
 // user-controlled string), state transitions re-render coarsely; text inputs
 // carry a data-fid marker so value/focus/selection survive re-renders, and
 // the message box keeps its scroll position across re-renders.
-import { api, hasToken, setToken, onWsEvent, connectWs, disconnectWs } from './api.js';
+import { api, hasToken, setToken, onWsEvent, connectWs, disconnectWs, wsSend } from './api.js';
 import * as store from './store.js';
 
 const state = store.state;
@@ -14,12 +14,19 @@ const ui = {
   unread: new Map(),      // convId -> count
   drafts: new Map(),      // convId -> composer draft
   editing: null,          // { convId, id, prevDraft }
+  replying: null,         // { convId, to: { id, sender, kind, preview } }
   picker: null,           // null | 'emoji' | 'stickers'
+  stickerPack: 0,         // selected pack index in the sticker picker
   select: null,           // Set of selected message ids (active conv only)
+  typing: new Map(),      // convId -> Map(ref -> expiry ts)
+  firstUnread: new Map(), // convId -> first unread message id (divider)
   searchQuery: '',
   searchResults: null,
   modal: null,
 };
+
+let stickerPacks = null;   // installed packs (null until first load)
+let stickerPacksLoading = false;
 
 let localSeq = 0;        // ids for optimistic local echoes
 let searchSeq = 0;       // drops stale search responses
@@ -85,6 +92,10 @@ const ICONS = {
   down: '<line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/>',
   camera: '<path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/>',
   more: '<circle cx="12" cy="12" r="1.4" fill="currentColor"/><circle cx="19" cy="12" r="1.4" fill="currentColor"/><circle cx="5" cy="12" r="1.4" fill="currentColor"/>',
+  reply: '<polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/>',
+  video: '<path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/>',
+  bell: '<path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/>',
+  sticker: '<path d="M21 12a9 9 0 1 1-9-9 9 9 0 0 1 9 9z" transform="scale(.92) translate(1 1)"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/>',
 };
 
 function icon(name, cls = '') {
@@ -146,7 +157,10 @@ function notifBody(m) {
   if (b.t === 'sticker') return `Sticker ${b.emoji || ''}`;
   if (b.t === 'file') {
     if (b.kind === 'voice') return 'Voice message';
-    return (b.mime || '').startsWith('image/') ? 'Photo' : (b.name || 'File');
+    if (b.kind === 'round') return 'Video message';
+    if ((b.mime || '').startsWith('image/')) return 'Photo';
+    if ((b.mime || '').startsWith('video/')) return 'Video';
+    return b.name || 'File';
   }
   return String(b.text || '').slice(0, 140);
 }
@@ -162,7 +176,7 @@ function notifyNewMessage(conv, m) {
   const opts = {
     body: notifBody(m),
     tag: `pathy-${conv.id}`,
-    icon: '/icon.svg',
+    icon: '/icon-192.png', // Android notifications cannot render SVG icons
     data: { convId: conv.id },
   };
   try {
@@ -176,7 +190,7 @@ function notifyNewMessage(conv, m) {
     liveNotifs.get(conv.id).push(n);
   } catch {
     // Android: page-created Notification is forbidden — go through the SW
-    swReg?.showNotification?.(title, { ...opts, badge: '/icon.svg' }).catch(() => {});
+    swReg?.showNotification?.(title, { ...opts, badge: '/icon-mono-96.png' }).catch(() => {});
   }
 }
 
@@ -366,7 +380,7 @@ function upsertMessage(convId, msg) {
     const echo = list.find((m) => m.pending && m.id == null && m.senderRef === msg.senderRef
       && m.body?.t === msg.body?.t
       && (m.body?.t !== 'text' || m.body.text === msg.body?.text)
-      && (m.body?.t !== 'sticker' || m.body.emoji === msg.body?.emoji));
+      && (m.body?.t !== 'sticker' || (m.body.emoji === msg.body?.emoji && m.body.sid === msg.body?.sid)));
     if (echo) {
       Object.assign(echo, msg, { pending: false, uploading: undefined });
       return list;
@@ -419,6 +433,8 @@ function markRead(conv) {
   if (!maxId || (lastReadSent.get(conv.id) || 0) >= maxId) return;
   lastReadSent.set(conv.id, maxId);
   ui.unread.delete(conv.id);
+  conv.reads = conv.reads || {};
+  conv.reads[state.me.ref] = maxId;
   api.markRead(conv.id, maxId).catch(() => lastReadSent.delete(conv.id));
 }
 
@@ -501,7 +517,8 @@ function renderMain() {
     || oldBox.scrollTop + oldBox.clientHeight >= oldBox.scrollHeight - 48;
   const prevScroll = oldBox?.scrollTop ?? 0;
 
-  const sidebar = h('div', { class: 'sidebar' }, renderSidebarTop(), renderSearchOrChats(), renderSidebarBottom());
+  const sidebar = h('div', { class: 'sidebar' },
+    renderSidebarTop(), renderNotifBanner(), renderSearchOrChats(), renderSidebarBottom());
   const main = h('div', { class: 'main' });
   if (ui.view === 'settings') main.append(renderSettings());
   else if (ui.view === 'bots') main.append(renderBots());
@@ -557,6 +574,34 @@ function runSearch(raw) {
   }).catch(() => { /* transient search errors */ });
 }
 
+// One-time prompt to turn on notifications — most "notifications don't
+// work" reports are simply the permission never having been requested.
+function renderNotifBanner() {
+  if (typeof Notification === 'undefined' || Notification.permission !== 'default') return null;
+  if (localStorage.getItem('pathy.notifBanner') === 'dismissed') return null;
+  return h('div', { class: 'notif-banner' },
+    icon('bell', 'nb-ic'),
+    h('div', { class: 'nb-text' },
+      h('div', { class: 'nb-title' }, 'Turn on notifications'),
+      h('div', { class: 'muted' }, 'Know about new messages even when Pathy is closed')),
+    h('button', {
+      class: 'small primary',
+      onclick: async () => {
+        const perm = await Notification.requestPermission();
+        if (perm === 'granted') {
+          localStorage.setItem('pathy.notify', 'on');
+          syncPushSubscription(true);
+          toast('notifications enabled');
+        }
+        renderMain();
+      },
+    }, 'Enable'),
+    h('button', {
+      class: 'icon-btn nb-close', title: 'Dismiss', 'aria-label': 'Dismiss',
+      onclick: () => { localStorage.setItem('pathy.notifBanner', 'dismissed'); renderMain(); },
+    }, icon('x')));
+}
+
 function renderSidebarTop() {
   const input = h('input', {
     class: 'search-input',
@@ -580,14 +625,44 @@ function renderSidebarTop() {
 function msgPreview(m) {
   if (!m) return '';
   if (m.error) return '…';
-  const who = m.senderRef === state.me.ref ? 'you: ' : '';
+  const who = m.senderRef === state.me.ref ? 'You: ' : '';
   const b = m.body || {};
-  if (b.t === 'sticker') return `${who}Sticker ${b.emoji || ''}`;
+  if (b.t === 'sticker') return `${who}${b.emoji ? `${b.emoji} ` : ''}Sticker`;
   if (b.t === 'file') {
     if (b.kind === 'voice') return `${who}Voice message`;
-    return `${who}${(b.mime || '').startsWith('image/') ? 'Photo' : (b.name || 'File')}`;
+    if (b.kind === 'round') return `${who}Video message`;
+    if ((b.mime || '').startsWith('image/')) return `${who}Photo`;
+    if ((b.mime || '').startsWith('video/')) return `${who}Video`;
+    return `${who}${b.name || 'File'}`;
   }
   return `${who}${b.text ?? ''}`;
+}
+
+// ---- typing indicators
+
+function typersOf(convId) {
+  const map = ui.typing.get(convId);
+  if (!map) return [];
+  const now = Date.now();
+  for (const [ref, exp] of map) if (exp <= now) map.delete(ref);
+  if (map.size === 0) ui.typing.delete(convId);
+  return [...map.keys()];
+}
+
+function typingLabel(conv) {
+  const typers = typersOf(conv.id);
+  if (typers.length === 0) return null;
+  if (conv.type === 'dm') return 'typing…';
+  if (typers.length === 1) return `${displayName(typers[0])} is typing…`;
+  return `${typers.length} people are typing…`;
+}
+
+const typingSentAt = new Map(); // convId -> last typing frame ts
+function sendTyping(convId) {
+  const now = Date.now();
+  if (now - (typingSentAt.get(convId) || 0) < 2500) return;
+  typingSentAt.set(convId, now);
+  wsSend({ type: 'typing', convId });
 }
 
 // ---- pinned chats
@@ -694,6 +769,7 @@ function renderSearchOrChats() {
       const last = ui.msgs.get(conv.id)?.at(-1);
       const unread = ui.unread.get(conv.id) || 0;
       const pinned = conv.pinOrder != null;
+      const typing = typingLabel(conv);
       const el = h('div', {
         class: `chat-item${conv.id === ui.activeConvId && ui.view === 'chats' ? ' active' : ''}`,
         onclick: () => openConv(conv.id),
@@ -707,7 +783,9 @@ function renderSearchOrChats() {
           pinned ? icon('pin', 'pin-mark') : null,
           last ? h('div', { class: 'chat-time' }, fmtTime(last.ts)) : null),
         h('div', { class: 'chat-row' },
-          h('div', { class: 'chat-prev' }, msgPreview(last)),
+          typing
+            ? h('div', { class: 'chat-prev typing-text' }, typing)
+            : h('div', { class: 'chat-prev' }, msgPreview(last)),
           unread > 0 ? h('div', { class: 'unread-badge' }, unread > 99 ? '99+' : unread) : null)),
       );
       addLongPress(el, () => openChatActions(conv));
@@ -764,6 +842,7 @@ async function openConv(id) {
   ui.unread.delete(id);
   ui.picker = null;
   ui.select = null;
+  if (ui.replying?.convId !== id) ui.replying = null;
   clearNotifications(id);
   renderMain();
   const conv = findConv(id);
@@ -778,26 +857,41 @@ async function openConv(id) {
       toast(errMsg(e), true);
     }
   }
+  // "Unread messages" divider — placed before the first message the other
+  // side sent past our read cursor, like Telegram.
+  const myRead = Number(conv.reads?.[state.me.ref] || 0);
+  const firstUn = (ui.msgs.get(id) || []).find((m) =>
+    m.id != null && Number(m.id) > myRead && m.senderRef !== state.me.ref);
+  if (firstUn) ui.firstUnread.set(id, String(firstUn.id));
+  else ui.firstUnread.delete(id);
   const peer = dmPeer(conv);
   if (peer && !state.bundles.has(peer)) store.getBundle(peer).then(() => renderMain()).catch(() => {});
   markRead(conv);
   renderMain();
   const box = app.querySelector('.messages');
-  if (box) box.scrollTop = box.scrollHeight;
+  if (box) {
+    const sep = box.querySelector('.unread-sep');
+    box.scrollTop = sep ? Math.max(0, sep.offsetTop - 80) : box.scrollHeight;
+  }
 }
 
 // -------------------------------------------------------- attachments (UI)
 
 const AUTOLOAD_IMAGE_BYTES = 8 * 1024 * 1024;
-const mediaCache = new Map(); // blobId -> { url?, error?, loading? }
+const AUTOLOAD_VIDEO_BYTES = 20 * 1024 * 1024;
+const mediaCache = new Map(); // blobId -> { url?, error?, loading?, progress? }
 
-function ensureImage(body) {
+function ensureMedia(body) {
   let entry = mediaCache.get(body.blobId);
   if (entry) return entry;
-  entry = { loading: true };
+  entry = { loading: true, progress: 0 };
   mediaCache.set(body.blobId, entry);
-  store.fetchFile(body).then((bytes) => {
-    entry.url = URL.createObjectURL(new Blob([bytes], { type: body.mime || 'image/png' }));
+  store.fetchFile(body, (p) => {
+    entry.progress = p;
+    const el = app.querySelector(`[data-load="${body.blobId}"]`);
+    if (el) el.textContent = `${Math.round(p * 100)}%`;
+  }).then((blob) => {
+    entry.url = URL.createObjectURL(blob);
     entry.loading = false;
     renderMain();
   }).catch((e) => {
@@ -811,8 +905,8 @@ function ensureImage(body) {
 async function downloadFile(body, btn) {
   try {
     if (btn) btn.disabled = true;
-    const bytes = await store.fetchFile(body);
-    const url = URL.createObjectURL(new Blob([bytes], { type: body.mime || 'application/octet-stream' }));
+    const blob = await store.fetchFile(body);
+    const url = URL.createObjectURL(blob);
     const a = h('a', { href: url, download: body.name || 'file' });
     document.body.append(a);
     a.click();
@@ -823,6 +917,24 @@ async function downloadFile(body, btn) {
   } finally {
     if (btn) btn.disabled = false;
   }
+}
+
+// Fit media into the bubble at its own aspect ratio (no cropping, no dead
+// space): scale down to the max box, never up beyond the source size.
+function mediaBox(w, h) {
+  if (!w || !h) return null;
+  const maxW = Math.min(340, Math.floor(window.innerWidth * 0.7));
+  const maxH = Math.min(400, Math.floor(window.innerHeight * 0.5));
+  const k = Math.min(maxW / w, maxH / h, 1);
+  return { w: Math.max(48, Math.round(w * k)), h: Math.max(48, Math.round(h * k)) };
+}
+
+function sizeToBox(el, b) {
+  const box = mediaBox(b.w, b.h);
+  if (!box) return el;
+  el.style.width = `${box.w}px`;
+  el.style.aspectRatio = `${b.w} / ${b.h}`;
+  return el;
 }
 
 function openImageViewer(url, name) {
@@ -853,14 +965,39 @@ async function imageDims(file) {
   } catch { return null; }
 }
 
+// Video dimensions + duration, read from metadata without decoding frames.
+function videoMeta(file) {
+  return new Promise((resolve) => {
+    const url = URL.createObjectURL(file);
+    const v = document.createElement('video');
+    const done = (d) => { URL.revokeObjectURL(url); resolve(d); };
+    const timer = setTimeout(() => done(null), 5000);
+    v.preload = 'metadata';
+    v.onloadedmetadata = () => {
+      clearTimeout(timer);
+      done({
+        w: v.videoWidth || null,
+        h: v.videoHeight || null,
+        dur: Number.isFinite(v.duration) ? Math.round(v.duration * 10) / 10 : null,
+      });
+    };
+    v.onerror = () => { clearTimeout(timer); done(null); };
+    v.src = url;
+  });
+}
+
 async function sendFiles(conv, files, extra = {}) {
+  const replyTo = takeReply(conv);
+  let first = true;
   for (const file of files) {
     if (!file) continue;
     if (file.size === 0) { toast(`${file.name || 'file'}: cannot send an empty file`, true); continue; }
-    if (file.size > store.MAX_FILE_BYTES) { toast(`${file.name || 'file'}: too large (max 64 MB)`, true); continue; }
+    if (file.size > store.MAX_FILE_BYTES) { toast(`${file.name || 'file'}: too large (max 2 GB)`, true); continue; }
     const isImage = (file.type || '').startsWith('image/');
-    const dims = isImage ? await imageDims(file) : null;
-    const meta = { ...(dims || {}), ...extra };
+    const isVideo = (file.type || '').startsWith('video/');
+    const dims = isImage ? await imageDims(file) : (isVideo ? await videoMeta(file) : null);
+    const meta = { ...(dims || {}), ...extra, ...(first && replyTo ? { replyTo } : {}) };
+    first = false;
     const localId = `local-${++localSeq}`;
     upsertMessage(conv.id, {
       localId,
@@ -874,7 +1011,7 @@ async function sendFiles(conv, files, extra = {}) {
     renderMain();
     try {
       const sent = await store.sendFile(conv, file, (p) => updateUploadProgress(localId, p), meta);
-      if (sent.body.blobId && isImage) {
+      if (sent.body.blobId && (isImage || isVideo)) {
         mediaCache.set(sent.body.blobId, { url: URL.createObjectURL(file) });
       }
       resolveEcho(conv.id, localId, sent);
@@ -898,8 +1035,8 @@ async function toggleVoice(body) {
     audioCache.set(body.blobId, entry);
     renderMain();
     try {
-      const bytes = await store.fetchFile(body);
-      entry.url = URL.createObjectURL(new Blob([bytes], { type: body.mime || 'audio/webm' }));
+      const blob = await store.fetchFile(body);
+      entry.url = URL.createObjectURL(blob);
       const audio = new Audio(entry.url);
       entry.audio = audio;
       audio.addEventListener('timeupdate', () => updateVoiceDom(body));
@@ -1020,43 +1157,286 @@ function stopRecording(cancel) {
   try { rec.recorder.stop(); } catch { /* already stopped */ }
 }
 
+// ---- replies (Telegram-style: quote pinned to the message)
+
+function replyKindOf(m) {
+  const b = m.body || {};
+  if (b.t === 'sticker') return 'sticker';
+  if (b.t === 'file') {
+    if (b.kind === 'voice') return 'voice';
+    if (b.kind === 'round') return 'round';
+    if ((b.mime || '').startsWith('image/')) return 'photo';
+    if ((b.mime || '').startsWith('video/')) return 'video';
+    return 'file';
+  }
+  return 'text';
+}
+
+function replyPreviewOf(m) {
+  if (m.error) return 'Message';
+  const b = m.body || {};
+  switch (replyKindOf(m)) {
+    case 'sticker': return `${b.emoji || ''} Sticker`.trim();
+    case 'voice': return 'Voice message';
+    case 'round': return 'Video message';
+    case 'photo': return 'Photo';
+    case 'video': return 'Video';
+    case 'file': return b.name || 'File';
+    default: return String(b.text || '').slice(0, 120);
+  }
+}
+
+function startReply(conv, m) {
+  if (m.id == null || m.pending) return;
+  ui.replying = {
+    convId: conv.id,
+    to: { id: String(m.id), sender: m.senderRef, kind: replyKindOf(m), preview: replyPreviewOf(m) },
+  };
+  if (ui.editing?.convId === conv.id) cancelEdit(conv);
+  else renderMain();
+  const input = app.querySelector('[data-fid="composer"]');
+  if (input) input.focus();
+}
+
+// Consume the pending reply target for a send in this conversation.
+function takeReply(conv) {
+  if (ui.replying?.convId !== conv.id) return null;
+  const to = ui.replying.to;
+  ui.replying = null;
+  return to;
+}
+
+function scrollToMsg(id) {
+  const el = app.querySelector(`.msg[data-mid="${id}"]`);
+  if (!el) return toast('message is not loaded', true);
+  el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  el.classList.remove('flash');
+  requestAnimationFrame(() => el.classList.add('flash'));
+  setTimeout(() => el.classList.remove('flash'), 1600);
+}
+
+// Per-user accent colors for sender names & reply quotes, like Telegram.
+function nameColorCls(ref) {
+  let a = 0;
+  for (const c of ref) a = (a * 31 + c.charCodeAt(0)) % 997;
+  return `nc${a % 7}`;
+}
+
+function replyQuote(rt) {
+  return h('div', {
+    class: `reply-quote ${nameColorCls(rt.sender)}`,
+    onclick: (e) => { e.stopPropagation(); if (!ui.select) scrollToMsg(rt.id); },
+  },
+  h('div', { class: 'rq-name' }, displayName(rt.sender)),
+  h('div', { class: 'rq-text' }, rt.preview || 'Message'));
+}
+
+// Swipe right on a message to reply (touch devices, like Telegram).
+function addSwipeReply(el, fn) {
+  let start = null;
+  let dx = 0;
+  el.addEventListener('touchstart', (e) => {
+    if (ui.select || e.touches.length !== 1) return;
+    start = { x: e.touches[0].clientX, y: e.touches[0].clientY, swiping: false };
+    dx = 0;
+  }, { passive: true });
+  el.addEventListener('touchmove', (e) => {
+    if (!start) return;
+    const mx = e.touches[0].clientX - start.x;
+    const my = e.touches[0].clientY - start.y;
+    if (!start.swiping) {
+      if (Math.abs(my) > 14 || Math.abs(mx) < 12) { if (Math.abs(my) > 14) start = null; return; }
+      start.swiping = true;
+    }
+    dx = Math.max(0, Math.min(72, mx));
+    el.style.transform = `translateX(${dx}px)`;
+    el.classList.toggle('swipe-armed', dx >= 48);
+  }, { passive: true });
+  const end = () => {
+    if (!start) return;
+    const fire = start.swiping && dx >= 48;
+    start = null;
+    el.style.transform = '';
+    el.classList.remove('swipe-armed');
+    if (fire) fn();
+  };
+  el.addEventListener('touchend', end);
+  el.addEventListener('touchcancel', end);
+}
+
+// ---- video messages ("circles")
+
+let roundRec = null; // guards against double recording
+
+async function openRoundRecorder(conv) {
+  if (roundRec) return;
+  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+    return toast('video recording is not supported in this browser', true);
+  }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'user', width: { ideal: 720 }, height: { ideal: 720 } },
+      audio: true,
+    });
+  } catch {
+    return toast('camera permission denied', true);
+  }
+  const mime = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4']
+    .find((t) => MediaRecorder.isTypeSupported(t)) || '';
+  const recorder = new MediaRecorder(stream, mime
+    ? { mimeType: mime, videoBitsPerSecond: 1_200_000, audioBitsPerSecond: 64_000 }
+    : undefined);
+  const chunks = [];
+  recorder.ondataavailable = (e) => { if (e.data?.size) chunks.push(e.data); };
+
+  const preview = h('video', { class: 'round-preview', autoplay: '', playsinline: '' });
+  preview.muted = true; // the attribute alone is unreliable for live streams
+  preview.srcObject = stream;
+  const timer = h('span', { class: 'rec-timer' }, '0:00');
+  const startTs = Date.now();
+  const tick = setInterval(() => {
+    timer.textContent = fmtDur((Date.now() - startTs) / 1000);
+    if (Date.now() - startTs > 60_000) finish(false); // 1 minute cap, like Telegram
+  }, 250);
+
+  const cleanup = () => {
+    clearInterval(tick);
+    stream.getTracks().forEach((t) => t.stop());
+    roundRec = null;
+  };
+  const finish = (cancel) => {
+    if (!roundRec) return;
+    roundRec.canceled = cancel;
+    try { recorder.stop(); } catch { cleanup(); closeModal(); }
+  };
+  recorder.onstop = () => {
+    const r = roundRec;
+    const dur = (Date.now() - startTs) / 1000;
+    cleanup();
+    closeModal();
+    if (!r || r.canceled) return;
+    if (dur < 0.6 || chunks.length === 0) return toast('recording too short', true);
+    const type = recorder.mimeType || mime || 'video/webm';
+    const stamp = new Date().toISOString().slice(0, 19).replaceAll(':', '-');
+    const file = new File(chunks, `round-${stamp}.${type.includes('mp4') ? 'mp4' : 'webm'}`, { type });
+    sendFiles(conv, [file], { kind: 'round', dur: Math.round(dur * 10) / 10 });
+  };
+  roundRec = { canceled: false };
+  recorder.start(250);
+  ui.modal = h('div', { class: 'modal-back round-back' },
+    h('div', { class: 'round-modal' },
+      h('div', { class: 'round-frame' }, preview),
+      h('div', { class: 'round-controls' },
+        h('button', {
+          class: 'icon-btn rec-cancel', title: 'Cancel', 'aria-label': 'Cancel video message',
+          onclick: () => finish(true),
+        }, icon('trash')),
+        h('span', { class: 'rec-dot' }),
+        timer,
+        h('div', { class: 'spacer' }),
+        h('button', {
+          class: 'send-btn has-text', title: 'Send', 'aria-label': 'Send video message',
+          onclick: () => finish(false),
+        }, icon('send')))));
+  renderMain();
+}
+
+function roundBubble(m, entry) {
+  const b = m.body;
+  const v = h('video', { class: 'round-video', src: entry.url, playsinline: '' });
+  const time = h('span', { class: 'round-time' }, fmtDur(b.dur || 0));
+  const wrap = h('div', {
+    class: 'round-wrap',
+    onclick: () => {
+      if (ui.select) return;
+      if (v.paused) {
+        document.querySelectorAll('video.round-video').forEach((o) => { if (o !== v) o.pause(); });
+        v.play().catch(() => {});
+      } else v.pause();
+    },
+  }, v, h('span', { class: 'round-overlay' }, icon('play')), time);
+  v.addEventListener('play', () => wrap.classList.add('playing'));
+  v.addEventListener('pause', () => wrap.classList.remove('playing'));
+  v.addEventListener('ended', () => { wrap.classList.remove('playing'); v.currentTime = 0; });
+  v.addEventListener('timeupdate', () => {
+    const total = b.dur || v.duration || 0;
+    time.textContent = fmtDur(v.paused ? total : Math.max(0, total - v.currentTime));
+  });
+  return wrap;
+}
+
+// The "load big attachment on demand" button, with live decrypt progress.
+function loadOnDemandBtn(b, label, ic) {
+  return h('button', {
+    class: 'file-load ghost',
+    onclick: (e) => { ensureMedia(b); e.currentTarget.disabled = true; renderMain(); },
+  }, icon(ic), ` ${label} (${fmtSize(b.size)})`);
+}
+
+function mediaPlaceholder(b, entry, label) {
+  const ph = h('div', { class: 'img-loading' },
+    icon('image'), h('span', { 'data-load': b.blobId }, entry.progress ? `${Math.round(entry.progress * 100)}%` : label));
+  sizeToBox(ph, b);
+  return ph;
+}
+
 function fileBubbleContent(m) {
   const b = m.body;
   const isImage = (b.mime || '').startsWith('image/');
+  const isVideo = (b.mime || '').startsWith('video/');
   const isVoice = b.kind === 'voice';
+  const isRound = b.kind === 'round';
 
   if (m.pending && m.uploading !== undefined) {
     const pct = Math.round((m.uploading || 0) * 100);
     const fill = h('div', { class: 'upload-fill' });
     fill.style.width = `${pct}%`;
     return h('div', { class: 'file-row' },
-      h('div', { class: 'file-icon' }, icon(isVoice ? 'mic' : (isImage ? 'image' : 'file'))),
+      h('div', { class: 'file-icon' }, icon(isVoice ? 'mic' : (isRound || isVideo ? 'video' : (isImage ? 'image' : 'file')))),
       h('div', { class: 'file-meta' },
-        h('div', { class: 'file-name' }, isVoice ? 'Voice message' : b.name),
+        h('div', { class: 'file-name' }, isVoice ? 'Voice message' : (isRound ? 'Video message' : b.name)),
         h('div', { class: 'upload-track' }, fill),
         h('div', { class: 'muted' }, h('span', { class: 'upload-pct' }, `${pct}%`), ` of ${fmtSize(b.size)} — encrypting & uploading`)));
   }
 
   if (isVoice && b.blobId) return voiceRow(m);
 
-  if (isImage && b.blobId) {
-    const entry = (b.size <= AUTOLOAD_IMAGE_BYTES || mediaCache.has(b.blobId)) ? ensureImage(b) : null;
-    if (!entry) {
-      return h('button', { class: 'file-load ghost', onclick: (e) => { ensureImage(b); e.target.disabled = true; } },
-        icon('image'), ` Load image (${fmtSize(b.size)})`);
-    }
+  if (isRound && b.blobId) {
+    const entry = (b.size <= AUTOLOAD_VIDEO_BYTES || mediaCache.has(b.blobId)) ? ensureMedia(b) : null;
+    if (!entry) return loadOnDemandBtn(b, 'Load video message', 'video');
     if (entry.error) return h('div', { class: 'broken-text' }, `⚠ ${entry.error}`);
     if (entry.loading) {
-      const ph = h('div', { class: 'img-loading' }, icon('image'), ' decrypting…');
-      if (b.w && b.h) { ph.style.aspectRatio = `${b.w} / ${b.h}`; ph.style.width = '320px'; }
-      return ph;
+      return h('div', { class: 'round-wrap loading' },
+        h('span', { class: 'voice-spin' }),
+        h('span', { class: 'round-time', 'data-load': b.blobId }, 'decrypting…'));
     }
+    return roundBubble(m, entry);
+  }
+
+  if (isImage && b.blobId) {
+    const entry = (b.size <= AUTOLOAD_IMAGE_BYTES || mediaCache.has(b.blobId)) ? ensureMedia(b) : null;
+    if (!entry) return loadOnDemandBtn(b, 'Load photo', 'image');
+    if (entry.error) return h('div', { class: 'broken-text' }, `⚠ ${entry.error}`);
+    if (entry.loading) return mediaPlaceholder(b, entry, 'decrypting…');
     const img = h('img', {
       class: 'img-attach', src: entry.url, alt: b.name, draggable: 'false',
       onclick: () => { if (!ui.select) openImageViewer(entry.url, b.name); },
     });
-    if (b.w && b.h) img.style.aspectRatio = `${b.w} / ${b.h}`; // reserve space, no layout jump
+    sizeToBox(img, b); // bubble hugs the photo's own aspect ratio
     return img;
+  }
+
+  if (isVideo && b.blobId) {
+    const entry = (b.size <= AUTOLOAD_VIDEO_BYTES || mediaCache.has(b.blobId)) ? ensureMedia(b) : null;
+    if (!entry) return loadOnDemandBtn(b, 'Load video', 'video');
+    if (entry.error) return h('div', { class: 'broken-text' }, `⚠ ${entry.error}`);
+    if (entry.loading) return mediaPlaceholder(b, entry, 'decrypting…');
+    const v = h('video', {
+      class: 'video-attach', src: entry.url, controls: '', playsinline: '', preload: 'metadata',
+    });
+    sizeToBox(v, b);
+    return v;
   }
 
   const dlBtn = h('button', { class: 'icon-btn dl', title: `Download ${b.name}`, 'aria-label': `Download ${b.name}` }, icon('download'));
@@ -1127,9 +1507,11 @@ function openMsgActions(conv, m) {
   const mine = m.senderRef === state.me.ref;
   const canEdit = mine && !m.error && m.body?.t === 'text';
   const canDelete = canDeleteMsg(conv, m);
+  const canPost = conv.type !== 'channel' || conv.myRole === 'admin';
   const items = [];
   const item = (ic, label, fn, cls = '') =>
     h('button', { class: `action-item ghost ${cls}`, onclick: () => { closeModal(); fn(); } }, icon(ic), label);
+  if (canPost) items.push(item('reply', 'Reply', () => startReply(conv, m)));
   if (!m.error && m.body?.t === 'text') {
     items.push(item('copy', 'Copy text', () =>
       navigator.clipboard?.writeText(m.body.text).then(() => toast('copied')).catch(() => {})));
@@ -1160,6 +1542,7 @@ function startEdit(conv, m) {
   ui.editing = { convId: conv.id, id: m.id, prevDraft: ui.drafts.get(conv.id) || '' };
   ui.drafts.set(conv.id, m.body.text);
   ui.picker = null;
+  ui.replying = null;
   renderMain();
   const input = app.querySelector('[data-fid="composer"]');
   if (input) { input.focus(); input.setSelectionRange(input.value.length, input.value.length); }
@@ -1188,6 +1571,304 @@ const EMOJI = {
 const STICKERS = ('😂 🤣 😍 🥰 😎 🤩 🥳 😜 🤪 😇 😉 😊 🙃 😏 🤤 😴 🥱 🤯 😱 😭 🥺 😢 😡 🤬 🤔 🧐 🙄 😬 🤫 🤭 '
   + '👍 👎 👏 🙏 💪 🤝 ✌️ 🤟 🤘 👌 👀 💋 🔥 ❤️ 💔 💯 ✨ 🎉 🎂 🌹 🌈 ☀️ ⚡ ⭐ 🍕 🍺 ☕ ⚽ 🚀 🐱 🐶 🦄 🙈 💩 🤖 👻 🎃').split(' ');
 
+// ---- sticker packs
+
+function loadStickerPacks(force = false) {
+  if (stickerPacksLoading || (stickerPacks && !force)) return;
+  stickerPacksLoading = true;
+  api.stickerPacks().then(({ packs }) => {
+    stickerPacks = packs;
+    stickerPacksLoading = false;
+    pickerCache = null;
+    renderMain();
+  }).catch(() => { stickerPacksLoading = false; });
+}
+
+// ---- animated .tgs stickers (Telegram format: gzipped Lottie JSON)
+
+let lottieMod = null; // lazily imported — ~420 KB, only loaded when needed
+const getLottie = () => {
+  if (!lottieMod) lottieMod = import('lottie-web').then((m) => m.default || m);
+  return lottieMod;
+};
+
+async function gunzip(bytes) {
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return new Response(stream).arrayBuffer();
+}
+
+const tgsDataCache = new Map(); // sid -> Promise<lottie animation JSON>
+function tgsData(sid) {
+  let p = tgsDataCache.get(sid);
+  if (!p) {
+    p = api.fetchSticker(sid)
+      .then(async (blob) => JSON.parse(new TextDecoder().decode(await gunzip(await blob.arrayBuffer()))));
+    tgsDataCache.set(sid, p);
+    p.catch(() => tgsDataCache.delete(sid));
+  }
+  return p;
+}
+
+// Rendered .tgs elements are cached and reused across re-renders (building a
+// Lottie instance is expensive), and played only while visible on screen.
+const tgsElCache = new Map(); // "<ctx>:<sid>" -> { el, anim }
+let tgsObserver = null;
+function ensureTgsObserver() {
+  if (!tgsObserver) {
+    tgsObserver = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        const anim = e.target._tgsAnim;
+        if (!anim) continue;
+        try {
+          if (e.isIntersecting) { anim.play(); anim.resize(); } else anim.pause();
+        } catch { /* renderer got torn down mid-flight */ }
+      }
+    });
+  }
+  return tgsObserver;
+}
+
+function tgsSticker(st, cls, ctx) {
+  const sid = st.sid ?? st.id;
+  const key = `${ctx}:${sid}`;
+  const hit = tgsElCache.get(key);
+  if (hit) return hit.el;
+  const el = h('div', { class: `${cls} tgs`, role: 'img', 'aria-label': st.emoji || 'animated sticker' });
+  if (st.w && st.h) el.style.aspectRatio = `${st.w} / ${st.h}`;
+  const entry = { el, anim: null };
+  tgsElCache.set(key, entry);
+  if (tgsElCache.size > 80) { // cap CPU/memory: drop the oldest instance
+    const [oldKey, old] = tgsElCache.entries().next().value;
+    old.anim?.destroy();
+    if (old.el._tgsAnim) tgsObserver?.unobserve(old.el);
+    tgsElCache.delete(oldKey);
+  }
+  if (typeof DecompressionStream === 'undefined') {
+    el.textContent = st.emoji || '🎞';
+    return el;
+  }
+  Promise.all([getLottie(), tgsData(sid)]).then(([lottie, data]) => {
+    if (!tgsElCache.has(key)) return; // evicted while loading
+    entry.anim = lottie.loadAnimation({
+      container: el,
+      renderer: 'canvas',
+      loop: true,
+      autoplay: false, // the observer starts it once visible
+      animationData: structuredClone(data), // lottie mutates its input
+      rendererSettings: { clearCanvas: true, dpr: Math.min(window.devicePixelRatio || 1, 2) },
+    });
+    el._tgsAnim = entry.anim;
+    if (el.isConnected) entry.anim.play(); // observer pauses it if off-screen
+    ensureTgsObserver().observe(el);
+  }).catch(() => { el.textContent = st.emoji || '⚠'; });
+  return el;
+}
+
+// Render one sticker (webp/png image, webm video, or animated tgs) with a
+// lazy authenticated fetch. `ctx` namespaces the tgs element cache so the
+// same sticker can live in the picker and in several messages at once.
+function stickerEl(st, cls, ctx = 'x') {
+  const sid = st.sid ?? st.id;
+  if ((st.mime || '') === 'application/x-tgsticker') return tgsSticker(st, cls, ctx);
+  const url = cachedImage(`st:${sid}`, () => api.fetchSticker(sid));
+  if (!url) return h('div', { class: `${cls} sticker-loading` });
+  if ((st.mime || '') === 'video/webm') {
+    const v = h('video', { class: cls, src: url, playsinline: '', loop: '' });
+    v.muted = true;
+    v.autoplay = true;
+    return v;
+  }
+  return h('img', { class: cls, src: url, alt: st.emoji || 'sticker', draggable: 'false', loading: 'lazy' });
+}
+
+// Downscale an image to sticker size (≤512px) and encode as WEBP (browsers
+// without WEBP export silently fall back to PNG).
+async function stickerBlobFromImage(file) {
+  const im = await decodeImage(file);
+  try {
+    const k = Math.min(512 / im.w, 512 / im.h, 1);
+    const w = Math.max(1, Math.round(im.w * k));
+    const hh = Math.max(1, Math.round(im.h * k));
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = hh;
+    canvas.getContext('2d').drawImage(im.src, 0, 0, w, hh);
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/webp', 0.9));
+    if (!blob) throw new Error('could not encode sticker');
+    return { blob, w, h: hh };
+  } finally {
+    im.close();
+  }
+}
+
+function openStickerManageModal() {
+  const err = h('div', { class: 'error-text' });
+  const tgInput = h('input', { placeholder: 't.me/addstickers/… or pack name', 'data-fid': 'tg-import' });
+  const tgBtn = h('button', {
+    class: 'primary small',
+    onclick: async () => {
+      err.textContent = '';
+      const name = tgInput.value.trim();
+      if (!name) return;
+      tgBtn.disabled = true;
+      tgBtn.textContent = 'importing…';
+      try {
+        const res = await api.importTelegramPack(name);
+        loadStickerPacks(true);
+        toast(res.existing ? `added “${res.pack.title}”` : `imported “${res.pack.title}” (${res.pack.stickers?.length ?? res.imported} stickers)`);
+        closeModal();
+      } catch (e) {
+        err.textContent = errMsg(e);
+        tgBtn.disabled = false;
+        tgBtn.textContent = 'Import';
+      }
+    },
+  }, 'Import');
+
+  const newTitle = h('input', { placeholder: 'New pack name', maxlength: '64', 'data-fid': 'new-pack' });
+  const createBtn = h('button', {
+    class: 'primary small',
+    onclick: async () => {
+      err.textContent = '';
+      const title = newTitle.value.trim();
+      if (!title) return;
+      try {
+        const { pack } = await api.createStickerPack(title);
+        loadStickerPacks(true);
+        openPackEditModal(pack.id);
+      } catch (e) { err.textContent = errMsg(e); }
+    },
+  }, 'Create');
+
+  const rows = (stickerPacks || []).map((p) => h('div', { class: 'member-row' },
+    p.stickers?.[0] ? stickerEl(p.stickers[0], 'pack-thumb', 'mng') : h('div', { class: 'pack-thumb' }, '🙂'),
+    h('div', { class: 'name' }, p.title, ' ',
+      h('span', { class: 'muted' }, `${p.stickers?.length ?? 0} stickers`)),
+    p.mine ? h('button', { class: 'small ghost', onclick: () => openPackEditModal(p.id) }, 'Edit') : null,
+    h('button', {
+      class: 'danger small',
+      onclick: async () => {
+        if (p.mine && !confirm(`Delete “${p.title}” for everyone who added it?`)) return;
+        try {
+          await api.deleteStickerPack(p.id);
+          loadStickerPacks(true);
+          closeModal();
+        } catch (e) { toast(errMsg(e), true); }
+      },
+    }, p.mine ? 'Delete' : 'Remove')));
+
+  ui.modal = modal('Stickers',
+    h('div', { class: 'field' },
+      h('label', {}, 'Import a Telegram pack'),
+      h('div', { class: 'row' }, tgInput, tgBtn),
+      h('div', { class: 'muted' }, 'Paste a t.me/addstickers link. Static, video and animated (.tgs) stickers are all supported.')),
+    h('div', { class: 'field' },
+      h('label', {}, 'Create your own pack'),
+      h('div', { class: 'row' }, newTitle, createBtn)),
+    err,
+    h('div', { class: 'field' }, h('label', {}, 'My packs'),
+      rows.length ? rows : h('div', { class: 'muted' }, 'No packs yet — import one from Telegram or create your own.')));
+  renderMain();
+}
+
+async function openPackEditModal(packId) {
+  let pack;
+  try {
+    pack = (await api.stickerPack(packId)).pack;
+  } catch (e) { return toast(errMsg(e), true); }
+  const err = h('div', { class: 'error-text' });
+  const emojiInput = h('input', { class: 'emoji-tag', placeholder: '🙂', maxlength: '8', 'data-fid': 'st-emoji' });
+  const fileInput = h('input', {
+    type: 'file', class: 'hidden-file', accept: 'image/*,video/webm,.tgs', multiple: '',
+    onchange: async (e) => {
+      const files = [...e.target.files];
+      e.target.value = '';
+      err.textContent = '';
+      for (const f of files) {
+        try {
+          const emoji = emojiInput.value.trim();
+          if ((f.name || '').toLowerCase().endsWith('.tgs') || f.type === 'application/x-tgsticker') {
+            // Telegram animated sticker: gzipped Lottie JSON — validate and
+            // read the canvas size client-side before uploading as-is.
+            if (typeof DecompressionStream === 'undefined') {
+              throw new Error('this browser cannot read .tgs files');
+            }
+            const bytes = await f.arrayBuffer();
+            const data = JSON.parse(new TextDecoder().decode(await gunzip(bytes)));
+            await api.uploadSticker(pack.id,
+              new Blob([bytes], { type: 'application/x-tgsticker' }),
+              { emoji, w: data.w || 512, h: data.h || 512 });
+          } else if (f.type === 'video/webm') {
+            const meta = await videoMeta(f);
+            await api.uploadSticker(pack.id, f, { emoji, w: meta?.w, h: meta?.h });
+          } else {
+            const { blob, w, h: hh } = await stickerBlobFromImage(f);
+            await api.uploadSticker(pack.id, blob, { emoji, w, h: hh });
+          }
+        } catch (ee) { err.textContent = errMsg(ee); }
+      }
+      loadStickerPacks(true);
+      openPackEditModal(pack.id); // re-render with fresh contents
+    },
+  });
+  const grid = h('div', { class: 'sticker-grid' },
+    pack.stickers.map((st) => h('div', { class: 'sticker-cell edit' },
+      stickerEl(st, 'sticker-img', 'edit'),
+      h('button', {
+        class: 'sticker-del', title: 'Remove sticker', 'aria-label': 'Remove sticker',
+        onclick: async () => {
+          try {
+            await api.deleteSticker(st.id);
+            loadStickerPacks(true);
+            openPackEditModal(pack.id);
+          } catch (e) { toast(errMsg(e), true); }
+        },
+      }, icon('x')))));
+  ui.modal = modal(pack.title,
+    h('div', { class: 'muted mb8' }, `${pack.stickers.length} stickers · anyone who receives one can add this pack`),
+    grid,
+    err,
+    h('div', { class: 'actions wrap' },
+      fileInput,
+      h('div', { class: 'row' },
+        emojiInput,
+        h('button', { class: 'ghost', onclick: () => fileInput.click() }, icon('plus'), ' Add stickers')),
+      h('button', { class: 'primary', onclick: closeModal }, 'Done')));
+  renderMain();
+}
+
+// Opened by tapping a sticker in the chat — preview + install, like Telegram.
+async function openStickerPackModal(packId) {
+  let pack;
+  try {
+    pack = (await api.stickerPack(packId)).pack;
+  } catch (e) { return toast(errMsg(e), true); }
+  ui.modal = modal(pack.title,
+    h('div', { class: 'sticker-grid' },
+      pack.stickers.map((st) => h('div', { class: 'sticker-cell' }, stickerEl(st, 'sticker-img', 'pack')))),
+    h('div', { class: 'actions' },
+      h('button', { class: 'ghost', onclick: closeModal }, 'Close'),
+      pack.installed
+        ? h('button', {
+          class: 'danger',
+          onclick: async () => {
+            try { await api.deleteStickerPack(pack.id); loadStickerPacks(true); closeModal(); } catch (e) { toast(errMsg(e), true); }
+          },
+        }, 'Remove pack')
+        : h('button', {
+          class: 'primary',
+          onclick: async () => {
+            try {
+              await api.installStickerPack(pack.id);
+              loadStickerPacks(true);
+              toast(`“${pack.title}” added to your stickers`);
+              closeModal();
+            } catch (e) { toast(errMsg(e), true); }
+          },
+        }, icon('plus'), ' Add stickers')));
+  renderMain();
+}
+
 function insertEmojiIntoComposer(emoji) {
   const input = app.querySelector('[data-fid="composer"]');
   if (!input) return;
@@ -1200,7 +1881,7 @@ function insertEmojiIntoComposer(emoji) {
   input.focus();
 }
 
-let pickerCache = null; // { tab, el } — heavy DOM, rebuilt only when the tab changes
+let pickerCache = null; // { key, el } — heavy DOM, rebuilt only when the tab/pack changes
 
 function buildPicker() {
   const tabBtn = (tab, label) => h('button', {
@@ -1212,47 +1893,84 @@ function buildPicker() {
     h('button', { class: 'icon-btn', title: 'Close', 'aria-label': 'Close picker', onclick: () => { ui.picker = null; renderMain(); } }, icon('x')));
   let body;
   if (ui.picker === 'stickers') {
-    body = h('div', { class: 'picker-body' },
-      h('div', { class: 'sticker-grid' },
-        STICKERS.map((st) => h('button', {
+    loadStickerPacks();
+    const packs = [
+      { id: 'builtin', title: 'Emoji', builtin: true, stickers: STICKERS },
+      ...(stickerPacks || []),
+    ];
+    const cur = packs[Math.min(ui.stickerPack, packs.length - 1)] || packs[0];
+    const packBar = h('div', { class: 'pack-bar' },
+      packs.map((p, i) => h('button', {
+        class: `pack-btn${p === cur ? ' active' : ''}`,
+        title: p.title, 'aria-label': p.title,
+        onclick: () => { ui.stickerPack = i; pickerCache = null; renderMain(); },
+      }, p.builtin ? '🙂' : (p.stickers?.[0] ? stickerEl(p.stickers[0], 'pack-thumb', 'bar') : '?'))),
+      h('div', { class: 'spacer' }),
+      h('button', {
+        class: 'icon-btn', title: 'Manage sticker packs', 'aria-label': 'Manage sticker packs',
+        onclick: () => openStickerManageModal(),
+      }, icon('plus')));
+    const grid = cur.builtin
+      ? h('div', { class: 'sticker-grid' },
+        cur.stickers.map((st) => h('button', {
           class: 'sticker-cell',
           onclick: () => {
             const conv = findConv(ui.activeConvId);
             if (conv) sendStickerFlow(conv, st);
           },
-        }, st))));
-  } else {
-    body = h('div', { class: 'picker-body' },
-      Object.entries(EMOJI).map(([cat, list]) => [
-        h('div', { class: 'picker-cat' }, cat),
-        h('div', { class: 'emoji-grid' },
-          list.map((em) => h('button', {
-            class: 'emoji-cell',
-            onclick: () => insertEmojiIntoComposer(em),
-          }, em))),
-      ]));
+        }, st)))
+      : h('div', { class: 'sticker-grid' },
+        cur.stickers.length === 0 ? h('div', { class: 'muted pad16' }, 'This pack is empty') : null,
+        cur.stickers.map((st) => h('button', {
+          class: 'sticker-cell',
+          title: st.emoji || '',
+          onclick: () => {
+            const conv = findConv(ui.activeConvId);
+            if (conv) {
+              sendStickerFlow(conv, {
+                sid: st.id, pack: cur.id, emoji: st.emoji || '', w: st.w, h: st.h, mime: st.mime,
+              });
+            }
+          },
+        }, stickerEl(st, 'sticker-img', 'pick'))));
+    body = h('div', { class: 'picker-body stickers' }, grid);
+    return h('div', { class: 'picker' }, head, packBar, body);
   }
+  body = h('div', { class: 'picker-body' },
+    Object.entries(EMOJI).map(([cat, list]) => [
+      h('div', { class: 'picker-cat' }, cat),
+      h('div', { class: 'emoji-grid' },
+        list.map((em) => h('button', {
+          class: 'emoji-cell',
+          onclick: () => insertEmojiIntoComposer(em),
+        }, em))),
+    ]));
   return h('div', { class: 'picker' }, head, body);
 }
 
 function renderPicker() {
   if (!ui.picker) { pickerCache = null; return null; }
-  if (!pickerCache || pickerCache.tab !== ui.picker) {
-    pickerCache = { tab: ui.picker, el: buildPicker() };
+  const key = `${ui.picker}:${ui.stickerPack}:${stickerPacks?.length ?? -1}`;
+  if (!pickerCache || pickerCache.key !== key) {
+    pickerCache = { key, el: buildPicker() };
   }
   return pickerCache.el;
 }
 
-async function sendStickerFlow(conv, emoji) {
+// st: plain emoji string (legacy) or { sid, pack, emoji, w, h, mime }.
+async function sendStickerFlow(conv, st) {
   ui.picker = null;
+  const replyTo = takeReply(conv);
+  const body = typeof st === 'string' ? { t: 'sticker', emoji: st } : { t: 'sticker', ...st };
+  if (replyTo) body.replyTo = replyTo;
   const localId = `local-${++localSeq}`;
   upsertMessage(conv.id, {
     localId, pending: true, senderRef: state.me.ref, ts: Date.now(),
-    body: { t: 'sticker', emoji }, verified: true,
+    body, verified: true,
   });
   renderMain();
   try {
-    const sent = await store.sendSticker(conv, emoji);
+    const sent = await store.sendSticker(conv, st, replyTo);
     resolveEcho(conv.id, localId, sent);
   } catch (e) {
     dropEcho(conv.id, localId);
@@ -1267,21 +1985,41 @@ function buildMessagesBox(conv) {
   const msgs = ui.msgs.get(conv.id) || [];
   const otherRead = maxOtherRead(conv);
   const selecting = ui.select != null;
+  const firstUnreadId = ui.firstUnread.get(conv.id);
+  const isRoom = conv.type !== 'dm';
   const rows = [];
   let lastDay = null;
-  for (const m of msgs) {
+
+  // Telegram-style grouping: consecutive messages from the same sender
+  // within 5 minutes share one visual block (tail only on the last one).
+  const GROUP_GAP = 5 * 60_000;
+  const sameGroup = (a, b) => !!a && !!b && !a.error === !b.error
+    && a.senderRef === b.senderRef
+    && new Date(a.ts).toDateString() === new Date(b.ts).toDateString()
+    && Math.abs(new Date(b.ts).getTime() - new Date(a.ts).getTime()) < GROUP_GAP;
+
+  msgs.forEach((m, i) => {
     const day = new Date(m.ts).toDateString();
-    if (day !== lastDay) {
+    const dayBreak = day !== lastDay;
+    if (dayBreak) {
       rows.push(h('div', { class: 'day-sep' }, h('span', {}, fmtDay(m.ts))));
       lastDay = day;
     }
+    const unreadBreak = firstUnreadId != null && m.id != null && String(m.id) === firstUnreadId;
+    if (unreadBreak) {
+      rows.push(h('div', { class: 'unread-sep' }, h('span', {}, 'Unread messages')));
+    }
     const mine = m.senderRef === state.me.ref;
     const isSticker = !m.error && m.body?.t === 'sticker';
+    const isRound = !m.error && m.body?.t === 'file' && m.body.kind === 'round' && !m.pending;
     const isBigEmoji = !m.error && m.body?.t === 'text' && emojiOnly(m.body.text);
-    const isMedia = !m.error && m.body?.t === 'file' && (m.body.mime || '').startsWith('image/')
-      && m.body.kind !== 'voice' && !m.uploading && !m.pending;
+    const isMedia = !m.error && m.body?.t === 'file' && !m.uploading && !m.pending
+      && m.body.kind !== 'voice' && m.body.kind !== 'round'
+      && ((m.body.mime || '').startsWith('image/') || (m.body.mime || '').startsWith('video/'));
     const read = mine && !m.pending && m.id != null && Number(m.id) <= otherRead;
     const selected = selecting && m.id != null && ui.select.has(String(m.id));
+    const grpFirst = dayBreak || unreadBreak || !sameGroup(i > 0 ? msgs[i - 1] : null, m);
+    const grpLast = !sameGroup(m, msgs[i + 1]);
 
     const stamp = h('span', { class: 'stamp' },
       !m.error && !m.pending && m.verified === false
@@ -1294,22 +2032,48 @@ function buildMessagesBox(conv) {
 
     let content;
     if (m.error) content = h('span', { class: 'text' }, `⚠ ${m.error}`);
-    else if (isSticker) content = h('div', { class: 'sticker-emoji' }, m.body.emoji || '');
-    else if (m.body?.t === 'file') content = fileBubbleContent(m);
+    else if (isSticker) {
+      content = m.body.sid
+        ? h('div', {
+          class: 'sticker-msg',
+          onclick: () => { if (!ui.select && m.body.pack) openStickerPackModal(m.body.pack); },
+        }, stickerEl({ ...m.body, id: m.body.sid }, 'sticker-img-big', `msg:${m.id ?? m.localId}`))
+        : h('div', { class: 'sticker-emoji' }, m.body.emoji || '');
+    } else if (m.body?.t === 'file') content = fileBubbleContent(m);
     else content = h('span', { class: 'text' }, linkify(m.body?.text ?? ''));
 
+    // sender name inside the bubble (rooms, first message of a group)
+    const senderRow = isRoom && !mine && grpFirst && !isSticker && !isBigEmoji && !isRound
+      ? h('div', {
+        class: `sender ${nameColorCls(m.senderRef)}`,
+        onclick: () => { if (!ui.select) openProfileModal(m.senderRef); },
+      }, displayName(m.senderRef))
+      : null;
+    const quote = !m.error && m.body?.replyTo ? replyQuote(m.body.replyTo) : null;
+    const bare = isSticker || isBigEmoji || isRound;
+
     const bubble = h('div', {
-      class: `bubble${m.error ? ' broken' : ''}${isMedia ? ' media' : ''}${isSticker ? ' sticker-bubble' : ''}${isBigEmoji ? ' big-emoji' : ''}`,
-    }, content, stamp);
+      class: `bubble${m.error ? ' broken' : ''}${isMedia ? ' media' : ''}${bare ? ' sticker-bubble' : ''}${isBigEmoji ? ' big-emoji' : ''}`,
+    },
+    senderRow,
+    bare && quote ? h('div', { class: 'quote-float' }, quote) : quote,
+    content, stamp);
+
+    // avatar column for rooms (incoming only, on the last message of a group)
+    const avCol = isRoom && !mine
+      ? h('div', { class: 'msg-av' },
+        grpLast
+          ? h('div', { onclick: () => { if (!ui.select) openProfileModal(m.senderRef); } },
+            avatarFor(m.senderRef.slice(2), m.senderRef.startsWith('b:') ? 'bot' : 'user', false, memberAv(conv, m.senderRef)))
+          : null)
+      : null;
 
     const msgEl = h('div', {
-      class: `msg${mine ? ' out' : ''}${selecting ? ' selecting' : ''}${selected ? ' sel' : ''}`,
-      'data-mid': m.localId || m.id,
+      class: `msg${mine ? ' out' : ''}${selecting ? ' selecting' : ''}${selected ? ' sel' : ''}`
+        + `${grpFirst ? ' grp-first' : ''}${grpLast ? ' grp-last' : ''}`,
+      'data-mid': m.id ?? m.localId, // server id once known — reply quotes jump by it
     },
-    conv.type !== 'dm' && !mine
-      ? h('div', { class: 'meta' },
-        h('span', { class: 'sender', onclick: () => openProfileModal(m.senderRef) }, displayName(m.senderRef)))
-      : null,
+    avCol,
     bubble,
     !selecting && m.id != null && !m.pending
       ? h('button', {
@@ -1325,9 +2089,10 @@ function buildMessagesBox(conv) {
     if (!selecting) {
       bubble.addEventListener('contextmenu', (e) => { e.preventDefault(); openMsgActions(conv, m); });
       addLongPress(bubble, () => openMsgActions(conv, m));
+      if (m.id != null && !m.pending) addSwipeReply(msgEl, () => startReply(conv, m));
     }
     rows.push(msgEl);
-  }
+  });
 
   const box = h('div', { class: 'messages', 'data-conv': String(conv.id) },
     msgs.length === 0
@@ -1347,9 +2112,10 @@ function renderChat() {
   const peerInfo = peer ? state.bundles.get(peer) : null;
   const canPost = conv.type !== 'channel' || conv.myRole === 'admin';
 
-  const sub = conv.type === 'dm'
+  const typing = typingLabel(conv);
+  const sub = typing || (conv.type === 'dm'
     ? (peer?.startsWith('b:') ? 'bot' : (peerInfo?.online === true ? 'online' : (peerInfo?.online === false ? 'offline' : '')))
-    : `${conv.type} · ${conv.members.length} member${conv.members.length > 1 ? 's' : ''}`;
+    : `${conv.type} · ${conv.members.length} member${conv.members.length > 1 ? 's' : ''}`);
 
   if (ui.select) {
     const sel = selectedMsgs(conv);
@@ -1387,7 +2153,7 @@ function renderChat() {
       onclick: () => (conv.type === 'dm' ? openProfileModal(peer) : openInfoModal(conv)),
     },
       h('div', { class: 'title' }, convTitle(conv)),
-      sub ? h('div', { class: `muted${peerInfo?.online === true ? ' online-text' : ''}` }, sub) : null),
+      sub ? h('div', { class: `muted${typing ? ' typing-text' : (peerInfo?.online === true ? ' online-text' : '')}` }, sub) : null),
     h('div', { class: 'spacer' }),
     h('button', {
       class: 'icon-btn',
@@ -1398,6 +2164,17 @@ function renderChat() {
   );
 
   const box = buildMessagesBox(conv);
+  // Floating "scroll to latest" button, like Telegram's down-arrow.
+  const fab = h('button', {
+    class: 'fab', title: 'To latest messages', 'aria-label': 'Scroll to latest messages',
+    onclick: () => { box.scrollTo({ top: box.scrollHeight, behavior: 'smooth' }); },
+  }, icon('down'));
+  const syncFab = () => {
+    fab.classList.toggle('show', box.scrollHeight - box.scrollTop - box.clientHeight > 400);
+  };
+  box.addEventListener('scroll', syncFab, { passive: true });
+  requestAnimationFrame(syncFab);
+  const boxWrap = h('div', { class: 'msgs-wrap' }, box, fab);
 
   let bottom;
   if (rec && rec.conv.id === conv.id) {
@@ -1416,6 +2193,7 @@ function renderChat() {
       }, icon('send')));
   } else if (canPost) {
     const editingThis = ui.editing?.convId === conv.id;
+    const replyingThis = !editingThis && ui.replying?.convId === conv.id;
     const fileInput = h('input', {
       type: 'file', class: 'hidden-file', multiple: '',
       onchange: (e) => {
@@ -1424,19 +2202,32 @@ function renderChat() {
         if (files.length) sendFiles(conv, files);
       },
     });
-    const input = h('input', {
+    const input = h('textarea', {
       class: 'composer-input',
       'data-fid': 'composer',
       placeholder: editingThis ? 'Edit message' : 'Message',
       maxlength: '4096',
+      rows: '1',
       autocomplete: 'off',
+      enterkeyhint: 'send',
       value: ui.drafts.get(conv.id) || '',
-      oninput: (e) => { ui.drafts.set(conv.id, e.target.value); syncSend(); },
+      oninput: (e) => {
+        ui.drafts.set(conv.id, e.target.value);
+        if (e.target.value.trim()) sendTyping(conv.id);
+        syncSend();
+        autogrow();
+      },
       onpaste: (e) => {
         const files = [...(e.clipboardData?.files || [])];
         if (files.length) { e.preventDefault(); sendFiles(conv, files); }
       },
     });
+    // grow with the text like Telegram, up to ~6 lines
+    const autogrow = () => {
+      input.style.height = 'auto';
+      input.style.height = `${Math.min(input.scrollHeight, 152)}px`;
+    };
+    requestAnimationFrame(autogrow);
     const send = async () => {
       const text = input.value.trim();
       if (!text) return;
@@ -1450,33 +2241,39 @@ function renderChat() {
           const res = await store.editText(conv, ed.id, text);
           const list = convMsgs(conv.id);
           const msg = list.find((x) => String(x.id) === String(ed.id));
-          if (msg) { msg.body = { t: 'text', text }; msg.editedAt = res.editedAt; msg.verified = true; }
+          if (msg) { msg.body = { ...msg.body, t: 'text', text }; msg.editedAt = res.editedAt; msg.verified = true; }
           if (ed.prevDraft) ui.drafts.set(conv.id, ed.prevDraft);
         } catch (e) { toast(errMsg(e), true); }
         renderMain();
         return;
       }
 
+      const replyTo = takeReply(conv);
       const localId = `local-${++localSeq}`;
       upsertMessage(conv.id, {
         localId, pending: true, senderRef: state.me.ref, ts: Date.now(),
-        body: { t: 'text', text }, verified: true,
+        body: { t: 'text', text, ...(replyTo ? { replyTo } : {}) }, verified: true,
       });
       renderMain();
       try {
-        const sent = await store.sendText(conv, text);
+        const sent = await store.sendText(conv, text, replyTo);
         resolveEcho(conv.id, localId, sent);
       } catch (e) {
         dropEcho(conv.id, localId);
         ui.drafts.set(conv.id, text); // give the draft back
+        if (replyTo) ui.replying = { convId: conv.id, to: replyTo };
         toast(errMsg(e), true);
       }
       renderMain();
     };
     input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') send();
-      else if (e.key === 'Escape') {
+      // Enter sends; Shift+Enter makes a newline (like Telegram Web)
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        send();
+      } else if (e.key === 'Escape') {
         if (editingThis) cancelEdit(conv);
+        else if (replyingThis) { ui.replying = null; renderMain(); }
         else if (ui.picker) { ui.picker = null; renderMain(); }
       }
     });
@@ -1485,11 +2282,16 @@ function renderChat() {
       class: 'icon-btn mic-btn', title: 'Record a voice message', 'aria-label': 'Record a voice message',
       onclick: () => startRecording(conv),
     }, icon('mic'));
+    const camBtn = h('button', {
+      class: 'icon-btn cam-btn', title: 'Record a video message', 'aria-label': 'Record a video message',
+      onclick: () => openRoundRecorder(conv),
+    }, icon('video'));
     const syncSend = () => {
       const has = input.value.trim().length > 0;
       sendBtn.classList.toggle('has-text', has || editingThis);
       sendBtn.hidden = !has && !editingThis;
       micBtn.hidden = has || editingThis;
+      camBtn.hidden = has || editingThis;
     };
     syncSend();
 
@@ -1502,10 +2304,22 @@ function renderChat() {
             (ui.msgs.get(conv.id) || []).find((x) => String(x.id) === String(ui.editing.id))?.body?.text || '')),
         h('button', { class: 'icon-btn', title: 'Cancel editing', 'aria-label': 'Cancel editing', onclick: () => cancelEdit(conv) }, icon('x')))
       : null;
+    const replyBar = replyingThis
+      ? h('div', { class: 'edit-bar' },
+        icon('reply', 'edit-ic'),
+        h('div', { class: `edit-info ${nameColorCls(ui.replying.to.sender)}` },
+          h('div', { class: 'edit-title' }, `Reply to ${displayName(ui.replying.to.sender)}`),
+          h('div', { class: 'muted ellip' }, ui.replying.to.preview || 'Message')),
+        h('button', {
+          class: 'icon-btn', title: 'Cancel reply', 'aria-label': 'Cancel reply',
+          onclick: () => { ui.replying = null; renderMain(); },
+        }, icon('x')))
+      : null;
 
     bottom = h('div', { class: 'composer-wrap' },
       renderPicker(),
       editBar,
+      replyBar,
       h('div', { class: 'composer' },
         fileInput,
         h('button', {
@@ -1513,14 +2327,14 @@ function renderChat() {
           onclick: () => { ui.picker = ui.picker ? null : 'emoji'; renderMain(); },
         }, icon('smile')),
         h('button', {
-          class: 'icon-btn', title: 'Attach a file (up to 64 MB)', 'aria-label': 'Attach a file',
+          class: 'icon-btn', title: 'Attach a file (up to 2 GB)', 'aria-label': 'Attach a file',
           onclick: () => fileInput.click(),
         }, icon('paperclip')),
-        input, micBtn, sendBtn));
+        input, camBtn, micBtn, sendBtn));
   } else {
     bottom = h('div', { class: 'readonly-note' }, icon('radio'), ' Only admins can post in this channel');
   }
-  return [header, box, bottom];
+  return [header, boxWrap, bottom];
 }
 
 // ---- modals
@@ -2112,6 +2926,7 @@ async function handleWsEvent(ev) {
     // have been added by the optimistic send path — this was the cause of
     // own messages showing up twice.
     upsertMessage(ev.convId, { ...ev.message, ...dec });
+    ui.typing.get(ev.convId)?.delete(ev.message.senderRef);
     const active = ui.activeConvId === ev.convId && ui.view === 'chats' && !document.hidden;
     if (ev.message.senderRef !== state.me.ref && !active) {
       ui.unread.set(ev.convId, (ui.unread.get(ev.convId) || 0) + 1);
@@ -2151,8 +2966,19 @@ async function handleWsEvent(ev) {
     if (conv) {
       conv.reads = conv.reads || {};
       conv.reads[ev.ref] = ev.lastReadId;
+      if (ev.ref === state.me.ref) {
+        // read on another of my devices — clear the badge & notifications here
+        ui.unread.delete(ev.convId);
+        clearNotifications(ev.convId);
+      }
       renderMain();
     }
+  } else if (ev.type === 'typing') {
+    if (ev.ref === state.me.ref) return;
+    if (!ui.typing.has(ev.convId)) ui.typing.set(ev.convId, new Map());
+    ui.typing.get(ev.convId).set(ev.ref, Date.now() + 6000);
+    renderMain();
+    setTimeout(() => { if (typersOf(ev.convId).length === 0) renderMain(); }, 6100);
   } else if (ev.type === 'conv_deleted') {
     state.conversations = state.conversations.filter((c) => c.id !== ev.convId);
     forgetConv(ev.convId);

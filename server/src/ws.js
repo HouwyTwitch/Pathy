@@ -3,7 +3,7 @@
 // Presence is only revealed to people who share a conversation with the
 // user, and only when their showOnline privacy setting allows it.
 import { WebSocketServer } from 'ws';
-import { q } from './db.js';
+import { q, memberOf, memberRefs } from './db.js';
 import { sessionFromToken } from './auth.js';
 import { bus } from './events.js';
 
@@ -34,6 +34,8 @@ export function attachWs(httpServer) {
   wss.on('connection', (ws) => {
     let user = null;
     let onEvent = null;
+    const memberCache = new Map(); // convId -> { ok, ts } (typing membership checks)
+    const typingTs = new Map();    // convId -> last relayed typing timestamp
 
     const authTimer = setTimeout(() => { if (!user) ws.close(4401, 'auth timeout'); }, 10_000);
 
@@ -65,7 +67,24 @@ export function attachWs(httpServer) {
         ws.send(JSON.stringify({ type: 'ready', ref: user.ref }));
         return;
       }
-      if (msg.type === 'ping') ws.send(JSON.stringify({ type: 'pong' }));
+      if (msg.type === 'ping') return ws.send(JSON.stringify({ type: 'pong' }));
+      // Typing indicators: relayed live to other members, never persisted.
+      if (msg.type === 'typing' && Number.isInteger(msg.convId)) {
+        const now = Date.now();
+        if (now - (typingTs.get(msg.convId) || 0) < 1500) return;
+        typingTs.set(msg.convId, now);
+        let cached = memberCache.get(msg.convId);
+        if (!cached || now - cached.ts > 60_000) {
+          cached = { ok: !!(await memberOf(msg.convId, user.ref)), ts: now };
+          memberCache.set(msg.convId, cached);
+        }
+        if (!cached.ok) return;
+        for (const ref of await memberRefs(msg.convId)) {
+          if (ref !== user.ref && ref.startsWith('u:')) {
+            bus.emit(`ws:${ref}`, { type: 'typing', convId: msg.convId, ref: user.ref });
+          }
+        }
+      }
     });
 
     ws.on('close', () => {

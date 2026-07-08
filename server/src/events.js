@@ -4,7 +4,6 @@
 // users' devices via Web Push for new messages.
 import { EventEmitter } from 'node:events';
 import { q, memberRefs } from './db.js';
-import { isOnline } from './ws.js';
 import { pushToUser } from './push.js';
 
 export const bus = new EventEmitter();
@@ -21,8 +20,12 @@ export async function deliver(refs, event, { skipBotUpdate = false } = {}) {
     if (ref.startsWith('b:')) botNames.push(ref.slice(2));
   }
   if (event.type === 'message') {
+    // Push to every subscribed device, online or not — the service worker
+    // suppresses the notification on devices where Pathy is focused. This
+    // is what makes notifications reach a closed phone app while a desktop
+    // tab is open (previously the online check swallowed those).
     for (const ref of refs) {
-      if (ref.startsWith('u:') && ref !== event.message?.senderRef && !isOnline(ref)) {
+      if (ref.startsWith('u:') && ref !== event.message?.senderRef) {
         pushToUser(ref, {
           convId: event.convId,
           from: event.message?.senderRef || '',

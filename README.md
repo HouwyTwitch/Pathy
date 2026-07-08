@@ -12,21 +12,34 @@ secret keys never leave the client.
 
 - **Direct messages** — find anyone by username and message them; no friends
   system required.
-- **Encrypted attachments** — send images (inline previews), links, and files
-  up to 64 MB. Files are encrypted client-side with a one-off key that travels
-  only inside the E2E-encrypted message; the server stores pure ciphertext.
-- **Voice messages** — record in the browser, sent through the same encrypted
-  blob pipeline, played back inline (Telegram-style).
+- **Encrypted attachments up to 2 GB** — photos and videos play inline and
+  the bubble hugs the media's own aspect ratio; any other file downloads on
+  tap. Files are chunk-encrypted client-side with a one-off key that travels
+  only inside the E2E-encrypted message; the server stores pure ciphertext
+  on disk.
+- **Voice & video messages** — record voice notes and Telegram-style round
+  video "circles" in the browser; both go through the same encrypted blob
+  pipeline and play back inline.
+- **Replies** — answer a specific message: the quote is pinned to your
+  message, tap it to jump back. Swipe right on mobile to reply.
+- **Sticker packs** — import any Telegram sticker pack by its
+  t.me/addstickers link: static (webp), video (webm) **and animated (.tgs)**
+  stickers all work — .tgs render through a CSP-safe Lottie player, playing
+  only while on screen. Build your own packs from images, webm clips or
+  .tgs files; tap a sticker someone sent to add its pack.
 - **Telegram-style messaging UX** — read receipts (✓ → ✓✓), edit & delete
-  messages (delete destroys the ciphertext server-side), emoji picker and
-  stickers, avatars, pinned & reorderable chats, chat deletion.
+  messages (delete destroys the ciphertext server-side), message grouping
+  with bubble tails, typing indicators, unread divider, jump-to-latest
+  button, emoji picker, avatars, pinned & reorderable chats, chat deletion.
 - **Notifications** — system notifications for new messages, including Web
-  Push to the installed (Android) app while it is closed. Pushes carry only
-  metadata the server already has (who wrote, in which chat) — never message
-  content, which the server cannot read anyway.
-- **Modern, minimal UI** — light & dark themes, and full mobile support:
-  single-pane navigation on phones, safe-area aware, installable (web
-  manifest with on-screen-keyboard handling).
+  Push to the installed (Android) app while it is closed. The service worker
+  re-registers rotated push subscriptions on its own, and pushes go to every
+  device (the focused one suppresses its copy). Pushes carry only metadata
+  the server already has (who wrote, in which chat) — never message content,
+  which the server cannot read anyway.
+- **Telegram-like UI** — light & dark themes, offline-capable PWA app shell,
+  and full mobile support: single-pane navigation on phones, safe-area
+  aware, installable (web manifest with on-screen-keyboard handling).
 - **Channels & groups** — Telegram-style: channels are broadcast (only admins
   post), groups let everyone post. Invites wrap the conversation keys to the
   new member's verified public keys; removing a member rotates the key.
@@ -63,6 +76,13 @@ docker compose --profile bots up -d --build
 > **TLS:** run the server behind a TLS-terminating reverse proxy (Caddy,
 > nginx, Traefik) in any real deployment, and set `TRUST_PROXY=1`.
 
+To enable **importing sticker packs from Telegram**, set `TELEGRAM_BOT_TOKEN`
+in `.env` to any bot token from [@BotFather](https://t.me/BotFather) — it is
+used only to download sticker files from Telegram's servers.
+
+Large attachments are stored (as ciphertext) under `BLOB_DIR`
+(`/data/blobs` in Docker, `data/blobs` in the repo otherwise).
+
 ## Development without Docker
 
 ```bash
@@ -76,8 +96,10 @@ Tests (crypto unit tests, full API smoke test, browser test):
 ```bash
 npm run test:crypto                 # primitives + negative cases
 npm run smoke                       # against a running server
+npm run test:features               # chunked blobs, stickers, typing (running server)
 npm i --no-save playwright \
-  && node scripts/browser-test.mjs  # UI test in real Chromium
+  && node scripts/browser-test.mjs \          # UI test in real Chromium
+  && node scripts/features-browser-test.mjs   # replies, circles, stickers, 2GB pipeline
 ```
 
 ## How the E2E works (short version)

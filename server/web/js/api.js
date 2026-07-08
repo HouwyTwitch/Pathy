@@ -4,10 +4,29 @@
 
 let token = localStorage.getItem('pathy.token') || null;
 
+// Mirror the session token into IndexedDB so the service worker can
+// re-register the Web Push subscription when the push service rotates it
+// (pushsubscriptionchange can fire with no page open at all).
+function mirrorTokenForSw(t) {
+  try {
+    const req = indexedDB.open('pathy-sw', 1);
+    req.onupgradeneeded = () => req.result.createObjectStore('kv');
+    req.onsuccess = () => {
+      const db = req.result;
+      const tx = db.transaction('kv', 'readwrite');
+      if (t) tx.objectStore('kv').put(t, 'token');
+      else tx.objectStore('kv').delete('token');
+      tx.oncomplete = () => db.close();
+    };
+  } catch { /* private mode or IDB disabled */ }
+}
+mirrorTokenForSw(token);
+
 export function setToken(t) {
   token = t;
   if (t) localStorage.setItem('pathy.token', t);
   else localStorage.removeItem('pathy.token');
+  mirrorTokenForSw(t);
 }
 
 export const hasToken = () => !!token;
@@ -70,16 +89,32 @@ export const api = {
   myBots: () => call('GET', '/bots'),
   createBot: (username) => call('POST', '/bots', { username }),
   deleteBot: (username) => call('DELETE', `/bots/${encodeURIComponent(username)}`),
-  uploadBlob,
+  initBlob: (convId, size, chunkBytes) =>
+    call('POST', `/conversations/${convId}/blobs`, { size, chunkBytes }),
+  uploadChunk,
   fetchBlob,
+  fetchBlobResponse,
+  stickerPacks: () => call('GET', '/stickers/packs'),
+  createStickerPack: (title) => call('POST', '/stickers/packs', { title }),
+  stickerPack: (id) => call('GET', `/stickers/packs/${id}`),
+  installStickerPack: (id) => call('POST', `/stickers/packs/${id}/install`),
+  deleteStickerPack: (id) => call('DELETE', `/stickers/packs/${id}`),
+  uploadSticker: (packId, blob, meta = {}) => {
+    const qs = new URLSearchParams();
+    for (const [k, v] of Object.entries(meta)) if (v) qs.set(k, v);
+    return putBinary(`/api/stickers/packs/${packId}/stickers?${qs}`, blob, 'POST');
+  },
+  deleteSticker: (sid) => call('DELETE', `/stickers/sticker/${sid}`),
+  fetchSticker: (sid) => fetchImage(`/api/stickers/sticker/${sid}/image`),
+  importTelegramPack: (name) => call('POST', '/stickers/import-telegram', { name }),
 };
 
-// Upload an already-encrypted blob. XHR instead of fetch so we can report
-// upload progress for large files.
-function uploadBlob(convId, bytes, onProgress) {
+// Upload one encrypted chunk. XHR instead of fetch so we can report
+// within-chunk upload progress for large files.
+function uploadChunk(blobId, idx, bytes, onProgress) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', `/api/conversations/${convId}/blobs`);
+    xhr.open('PUT', `/api/blobs/${encodeURIComponent(blobId)}/chunks/${idx}`);
     xhr.setRequestHeader('content-type', 'application/octet-stream');
     if (token) xhr.setRequestHeader('authorization', `Bearer ${token}`);
     xhr.responseType = 'json';
@@ -97,7 +132,7 @@ function uploadBlob(convId, bytes, onProgress) {
   });
 }
 
-async function fetchBlob(blobId) {
+async function fetchBlobResponse(blobId) {
   const res = await fetch(`/api/blobs/${encodeURIComponent(blobId)}`, {
     headers: token ? { authorization: `Bearer ${token}` } : {},
   });
@@ -106,12 +141,16 @@ async function fetchBlob(blobId) {
     try { data = await res.json(); } catch { /* not json */ }
     throw new ApiError(res.status, data?.error || `http ${res.status}`);
   }
-  return new Uint8Array(await res.arrayBuffer());
+  return res;
 }
 
-async function putBinary(url, blob) {
+async function fetchBlob(blobId) {
+  return new Uint8Array(await (await fetchBlobResponse(blobId)).arrayBuffer());
+}
+
+async function putBinary(url, blob, method = 'PUT') {
   const res = await fetch(url, {
-    method: 'PUT',
+    method,
     headers: {
       'content-type': blob.type || 'image/jpeg',
       ...(token ? { authorization: `Bearer ${token}` } : {}),
@@ -176,4 +215,11 @@ export function disconnectWs() {
   closedByUser = true;
   if (ws) ws.close();
   ws = null;
+}
+
+// Fire-and-forget client → server frame (typing indicators etc).
+export function wsSend(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try { ws.send(JSON.stringify(obj)); } catch { /* racing a close */ }
+  }
 }

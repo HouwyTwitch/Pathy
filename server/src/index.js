@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { initDb, pool } from './db.js';
 import { initPush } from './push.js';
+import { initBlobDir } from './blobstore.js';
 import { HttpError } from './util.js';
 import { api } from './routes/api.js';
 import { botapi } from './routes/botapi.js';
@@ -36,7 +37,7 @@ app.use((req, res, next) => {
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
     'Referrer-Policy': 'no-referrer',
-    'Permissions-Policy': 'camera=(), microphone=(self), geolocation=()', // mic: voice messages
+    'Permissions-Policy': 'camera=(self), microphone=(self), geolocation=()', // mic: voice notes, camera: video circles
     'Cross-Origin-Opener-Policy': 'same-origin',
     'Cross-Origin-Resource-Policy': 'same-origin',
   });
@@ -78,6 +79,12 @@ app.use('/vendor/@noble', (req, res, next) => {
   next();
 });
 app.use('/vendor/@noble', express.static(path.join(repoRoot, 'node_modules', '@noble'), staticOpts));
+// Lottie player (animated .tgs stickers) — lazy-imported by the client.
+app.use('/vendor/lottie-web', (req, res, next) => {
+  if (!req.path.endsWith('.js')) return res.status(404).end();
+  next();
+});
+app.use('/vendor/lottie-web', express.static(path.join(repoRoot, 'node_modules', 'lottie-web'), staticOpts));
 app.use(express.static(path.join(repoRoot, 'server', 'web'), { ...staticOpts, index: 'index.html' }));
 
 app.use((req, res) => res.status(404).json({ error: 'not found' }));
@@ -95,6 +102,7 @@ const port = Number(process.env.PORT) || 8080;
 
 await initDb();
 await initPush();
+await initBlobDir();
 const server = http.createServer(app);
 attachWs(server);
 server.listen(port, () => console.log(`pathy server listening on :${port}`));

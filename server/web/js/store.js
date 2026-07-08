@@ -222,12 +222,15 @@ async function sendBody(conv, body) {
   }
 }
 
-export function sendText(conv, text) {
-  return sendBody(conv, { t: 'text', text, ts: Date.now() });
+export function sendText(conv, text, replyTo = null) {
+  return sendBody(conv, { t: 'text', text, ...(replyTo ? { replyTo } : {}), ts: Date.now() });
 }
 
-export function sendSticker(conv, emoji) {
-  return sendBody(conv, { t: 'sticker', emoji, ts: Date.now() });
+// st is either a plain emoji string (legacy built-in stickers) or a pack
+// sticker { sid, pack, emoji, w, h, mime }.
+export function sendSticker(conv, st, replyTo = null) {
+  const body = typeof st === 'string' ? { t: 'sticker', emoji: st } : { t: 'sticker', ...st };
+  return sendBody(conv, { ...body, ...(replyTo ? { replyTo } : {}), ts: Date.now() });
 }
 
 // Re-encrypt the edited text under the current conversation key and replace
@@ -256,19 +259,28 @@ export async function editText(conv, msgId, text) {
 
 // ----------------------------------------------------------- attachments
 
-export const MAX_FILE_BYTES = 64 * 1024 * 1024;
+export const MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024; // 2 GB
 
-// Encrypt a File/Blob with a one-off key, upload the ciphertext, then send
-// a message whose (E2E-encrypted) body carries the blob reference + key.
-// `extra` merges additional metadata into the body (image dimensions,
-// voice-note kind/duration, …).
+// Encrypt a File/Blob chunk by chunk with a one-off key, upload the
+// ciphertext chunks in order, then send a message whose (E2E-encrypted)
+// body carries the blob reference + key. Chunking keeps memory flat, so
+// multi-gigabyte files work in the browser. `extra` merges additional
+// metadata into the body (image dimensions, voice/round kind, replyTo, …).
 export async function sendFile(conv, file, onProgress, extra = {}) {
-  if (file.size > MAX_FILE_BYTES) throw new Error('file is too large (max 64 MB)');
+  if (file.size > MAX_FILE_BYTES) throw new Error('file is too large (max 2 GB)');
   if (file.size === 0) throw new Error('cannot send an empty file');
-  const bytes = new Uint8Array(await file.arrayBuffer());
   const blobKey = C.newBlobKey();
-  const { n, ct } = C.encryptBlob(blobKey, bytes);
-  const { blobId } = await api.uploadBlob(conv.id, ct, onProgress);
+  const prefix = C.newBlobNoncePrefix();
+  const cs = C.BLOB_CHUNK_BYTES;
+  const total = Math.ceil(file.size / cs);
+  const { blobId } = await api.initBlob(conv.id, file.size, cs);
+  for (let i = 0; i < total; i++) {
+    const slice = file.slice(i * cs, Math.min(file.size, (i + 1) * cs));
+    const pt = new Uint8Array(await slice.arrayBuffer());
+    const ct = C.encryptBlobChunk(blobKey, prefix, i, total, pt);
+    await api.uploadChunk(blobId, i, ct, (p) => onProgress?.((i + p) / total));
+    onProgress?.((i + 1) / total);
+  }
   const body = {
     t: 'file',
     name: String(file.name || 'file').slice(0, 255),
@@ -276,7 +288,8 @@ export async function sendFile(conv, file, onProgress, extra = {}) {
     mime: String(file.type || 'application/octet-stream').slice(0, 127),
     blobId,
     k: C.toB64(blobKey),
-    n,
+    np: C.toB64(prefix),
+    cs,
     ...extra,
     ts: Date.now(),
   };
@@ -285,14 +298,54 @@ export async function sendFile(conv, file, onProgress, extra = {}) {
 }
 
 // Download + decrypt an attachment referenced by a file message body.
-// Throws if the server returned a different blob than the sender uploaded.
-export async function fetchFile(body) {
-  const ct = await api.fetchBlob(body.blobId);
+// Returns a Blob (browsers spill big blobs to disk, so 2 GB files are OK).
+// Throws if the server returned different bytes than the sender uploaded.
+export async function fetchFile(body, onProgress) {
+  if (!body.np) {
+    // v1 (legacy): whole file sealed in one AEAD call
+    const ct = await api.fetchBlob(body.blobId);
+    try {
+      return new Blob([C.decryptBlob(C.fromB64(body.k), body.n, ct)],
+        { type: body.mime || 'application/octet-stream' });
+    } catch {
+      throw new Error('attachment failed integrity check (tampered or corrupted)');
+    }
+  }
+  const key = C.fromB64(body.k);
+  const prefix = C.fromB64(body.np);
+  const cs = body.cs;
+  const total = Math.ceil(body.size / cs);
+  const res = await api.fetchBlobResponse(body.blobId);
+  const reader = res.body.getReader();
+  const parts = [];
+  let buf = new Uint8Array(0);
+  let idx = 0;
+  const ctLenOf = (i) => (i === total - 1 ? body.size - (total - 1) * cs : cs) + 16;
   try {
-    return C.decryptBlob(C.fromB64(body.k), body.n, ct);
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (value) {
+        const merged = new Uint8Array(buf.length + value.length);
+        merged.set(buf, 0);
+        merged.set(value, buf.length);
+        buf = merged;
+        while (idx < total && buf.length >= ctLenOf(idx)) {
+          const ctLen = ctLenOf(idx);
+          parts.push(C.decryptBlobChunk(key, prefix, idx, total, buf.subarray(0, ctLen)));
+          buf = buf.slice(ctLen);
+          idx++;
+          onProgress?.(idx / total);
+        }
+      }
+      if (done) break;
+    }
   } catch {
     throw new Error('attachment failed integrity check (tampered or corrupted)');
   }
+  if (idx !== total || buf.length !== 0) {
+    throw new Error('attachment is incomplete (truncated download)');
+  }
+  return new Blob(parts, { type: body.mime || 'application/octet-stream' });
 }
 
 // -------------------------------------------------- create / invite / rotate

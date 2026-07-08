@@ -11,6 +11,8 @@ import { rateLimit } from '../ratelimit.js';
 import { deliver, deliverToConversation } from '../events.js';
 import { isOnline } from '../ws.js';
 import { vapidPublicKey } from '../push.js';
+import { stickers } from './stickers.js';
+import { appendChunk, blobSize, streamBlob, removeBlobFile } from '../blobstore.js';
 
 export const api = Router();
 
@@ -125,7 +127,8 @@ api.post('/login', authLimiter, asyncRoute(async (req, res) => {
 api.get('/push/vapid', (req, res) => res.json({ key: vapidPublicKey() }));
 
 api.use(requireSession);
-api.use(rateLimit({ windowMs: 60_000, max: 600, keyFn: (req) => req.user.ref }));
+api.use(rateLimit({ windowMs: 60_000, max: 1500, keyFn: (req) => req.user.ref }));
+api.use('/stickers', stickers);
 
 // ------------------------------------------------------- push subscriptions
 
@@ -728,7 +731,9 @@ api.delete('/conversations/:id', asyncRoute(async (req, res) => {
     throw new HttpError(403, 'only admins can delete a group or channel — leave it instead');
   }
   await deliverToConversation(convId, { type: 'conv_deleted', convId, by: me });
+  const files = await q("SELECT id FROM blobs WHERE conv_id = $1 AND store = 'file'", [convId]);
   await q('DELETE FROM conversations WHERE id = $1', [convId]);
+  for (const b of files.rows) removeBlobFile(b.id).catch(() => {});
   res.json({ ok: true });
 }));
 
@@ -813,46 +818,92 @@ api.put('/me/pins', asyncRoute(async (req, res) => {
 
 // ------------------------------------------------------------------ blobs
 
-// Encrypted attachments. Clients encrypt files with a random per-file key
-// before upload; the key travels only inside the E2E-encrypted message that
-// references the blob, so the server stores pure ciphertext.
-const MAX_BLOB_SIZE = 64 * 1024 * 1024 + 4096; // 64 MB plaintext + AEAD overhead
+// Encrypted attachments up to 2 GB. Clients split files into fixed-size
+// chunks, encrypt each with a per-file key (the key travels only inside the
+// E2E-encrypted message referencing the blob), and upload them in order.
+// Ciphertext lands on disk (see blobstore.js) — BYTEA rows cannot hold 2 GB.
+const MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024;   // 2 GB plaintext
+const MIN_CHUNK = 64 * 1024;
+const MAX_CHUNK = 8 * 1024 * 1024;
+const AEAD_TAG = 16;
 const BLOB_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
-const blobLimiter = rateLimit({ windowMs: 60_000, max: 30, keyFn: (req) => req.user.ref });
+const blobInitLimiter = rateLimit({ windowMs: 60_000, max: 30, keyFn: (req) => req.user.ref });
+const chunkLimiter = rateLimit({ windowMs: 60_000, max: 1200, keyFn: (req) => req.user.ref });
 
-api.post(
-  '/conversations/:id/blobs',
-  blobLimiter,
-  raw({ type: 'application/octet-stream', limit: MAX_BLOB_SIZE }),
+// Step 1: declare the upload. Returns the blob id chunks are PUT against.
+api.post('/conversations/:id/blobs', blobInitLimiter, asyncRoute(async (req, res) => {
+  const convId = Number(req.params.id);
+  const { conv, role } = await requireMembership(convId, req.user.ref);
+  if (conv.type === 'channel' && role !== 'admin') {
+    throw new HttpError(403, 'only admins post in channels');
+  }
+  const { size, chunkBytes } = req.body || {};
+  if (!Number.isInteger(size) || size < 1 || size > MAX_FILE_BYTES) {
+    throw new HttpError(400, 'size must be 1 byte .. 2 GB');
+  }
+  if (!Number.isInteger(chunkBytes) || chunkBytes < MIN_CHUNK || chunkBytes > MAX_CHUNK) {
+    throw new HttpError(400, `chunkBytes must be ${MIN_CHUNK}..${MAX_CHUNK}`);
+  }
+  const chunks = Math.ceil(size / chunkBytes);
+  const id = randomUUID();
+  await q(
+    `INSERT INTO blobs (id, conv_id, uploader_ref, size, data, store, chunks, chunk_bytes, received, ready)
+     VALUES ($1, $2, $3, $4, NULL, 'file', $5, $6, 0, false)`,
+    [id, convId, req.user.ref, size, chunks, chunkBytes],
+  );
+  res.status(201).json({ blobId: id, chunks });
+}));
+
+// Step 2: upload ciphertext chunks in order. Every chunk must be exactly
+// plaintext-chunk + AEAD tag, so truncation/padding is caught right here.
+api.put(
+  '/blobs/:id/chunks/:idx',
+  chunkLimiter,
+  raw({ type: 'application/octet-stream', limit: MAX_CHUNK + AEAD_TAG }),
   asyncRoute(async (req, res) => {
-    const convId = Number(req.params.id);
-    const { conv, role } = await requireMembership(convId, req.user.ref);
-    if (conv.type === 'channel' && role !== 'admin') {
-      throw new HttpError(403, 'only admins post in channels');
+    const id = String(req.params.id || '');
+    const idx = Number(req.params.idx);
+    if (!BLOB_ID_RE.test(id)) throw new HttpError(400, 'bad blob id');
+    if (!Number.isInteger(idx) || idx < 0) throw new HttpError(400, 'bad chunk index');
+    const r = await q(
+      'SELECT uploader_ref, size, store, chunks, chunk_bytes, received, ready FROM blobs WHERE id = $1',
+      [id],
+    );
+    const b = r.rows[0];
+    if (!b || b.store !== 'file') throw new HttpError(404, 'upload not found');
+    if (b.uploader_ref !== req.user.ref) throw new HttpError(403, 'not your upload');
+    if (b.ready) throw new HttpError(409, 'upload already completed');
+    if (idx !== b.received) throw new HttpError(409, `expected chunk ${b.received}`);
+    const size = Number(b.size);
+    const ptLen = idx === b.chunks - 1 ? size - (b.chunks - 1) * b.chunk_bytes : b.chunk_bytes;
+    if (!Buffer.isBuffer(req.body) || req.body.length !== ptLen + AEAD_TAG) {
+      throw new HttpError(400, `chunk ${idx} must be ${ptLen + AEAD_TAG} bytes`);
     }
-    if (!Buffer.isBuffer(req.body) || req.body.length < 17) {
-      throw new HttpError(400, 'expected an encrypted blob (application/octet-stream)');
-    }
-    const id = randomUUID();
-    await q('INSERT INTO blobs (id, conv_id, uploader_ref, size, data) VALUES ($1, $2, $3, $4, $5)', [
-      id, convId, req.user.ref, req.body.length, req.body,
-    ]);
-    res.status(201).json({ blobId: id, size: req.body.length });
+    await appendChunk(id, req.body);
+    const upd = await q(
+      'UPDATE blobs SET received = received + 1, ready = (received + 1 = chunks) WHERE id = $1 AND received = $2 RETURNING ready',
+      [id, idx],
+    );
+    if (upd.rowCount === 0) throw new HttpError(409, 'concurrent upload — chunks must be sequential');
+    res.json({ ok: true, received: idx + 1, ready: upd.rows[0].ready });
   }),
 );
 
 api.get('/blobs/:id', asyncRoute(async (req, res) => {
   const id = String(req.params.id || '');
   if (!BLOB_ID_RE.test(id)) throw new HttpError(400, 'bad blob id');
-  const r = await q('SELECT conv_id, data FROM blobs WHERE id = $1', [id]);
+  const r = await q('SELECT conv_id, data, store, ready FROM blobs WHERE id = $1', [id]);
   if (!r.rows[0]) throw new HttpError(404, 'blob not found');
   await requireMembership(r.rows[0].conv_id, req.user.ref);
   res.set({
     'Content-Type': 'application/octet-stream',
     'Cache-Control': 'private, max-age=31536000, immutable',
   });
-  res.send(r.rows[0].data);
+  if (r.rows[0].store === 'db') return res.send(r.rows[0].data);
+  if (!r.rows[0].ready) throw new HttpError(409, 'upload not finished');
+  res.set('Content-Length', String(await blobSize(id)));
+  streamBlob(id).on('error', () => res.destroy()).pipe(res);
 }));
 
 // ------------------------------------------------------------------- bots

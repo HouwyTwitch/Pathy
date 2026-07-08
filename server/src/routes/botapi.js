@@ -8,6 +8,7 @@ import { REF_RE, isPublicBundle, isCipherMessage, HttpError, asyncRoute } from '
 import { requireBot } from '../auth.js';
 import { rateLimit } from '../ratelimit.js';
 import { bus, deliverToConversation } from '../events.js';
+import { blobSize, streamBlob } from '../blobstore.js';
 
 export const botapi = Router({ mergeParams: true });
 
@@ -141,14 +142,18 @@ botapi.post(
 botapi.get('/blobs/:id', asyncRoute(async (req, res) => {
   const id = String(req.params.id || '');
   if (!BLOB_ID_RE.test(id)) throw new HttpError(400, 'bad blob id');
-  const r = await q('SELECT conv_id, data FROM blobs WHERE id = $1', [id]);
+  const r = await q('SELECT conv_id, data, store, ready FROM blobs WHERE id = $1', [id]);
   if (!r.rows[0]) throw new HttpError(404, 'blob not found');
   await requireBotMembership(r.rows[0].conv_id, req.bot.ref);
   res.set({
     'Content-Type': 'application/octet-stream',
     'Cache-Control': 'private, max-age=31536000, immutable',
   });
-  res.send(r.rows[0].data);
+  // v2 blobs (chunk-encrypted, up to 2 GB) live on disk, not in the row
+  if (r.rows[0].store === 'db') return res.send(r.rows[0].data);
+  if (!r.rows[0].ready) throw new HttpError(409, 'upload not finished');
+  res.set('Content-Length', String(await blobSize(id)));
+  streamBlob(id).on('error', () => res.destroy()).pipe(res);
 }));
 
 botapi.post('/sendMessage', asyncRoute(async (req, res) => {

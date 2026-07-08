@@ -221,6 +221,34 @@ export function decryptBlob(key, nonceB64, ct) {
   return xchacha20poly1305(key, fromB64(nonceB64), aad).decrypt(ct);
 }
 
+// v2: chunked encryption for large files (up to 2 GB — far beyond what a
+// single in-memory AEAD call can take). Chunk nonce = 20-byte random prefix
+// + 32-bit big-endian chunk counter; the AAD binds chunk index and total
+// count, so chunks cannot be reordered, dropped, duplicated, or spliced
+// between files without failing authentication.
+export const BLOB_CHUNK_BYTES = 4 * 1024 * 1024;
+
+export function newBlobNoncePrefix() {
+  return randomBytes(20);
+}
+
+function blobChunkNonce(prefix, index) {
+  const n = new Uint8Array(24);
+  n.set(prefix, 0);
+  new DataView(n.buffer, n.byteOffset).setUint32(20, index);
+  return n;
+}
+
+export function encryptBlobChunk(key, prefix, index, total, bytes) {
+  const aad = canon(['pathy-blob-v2', String(index), String(total)]);
+  return xchacha20poly1305(key, blobChunkNonce(prefix, index), aad).encrypt(bytes);
+}
+
+export function decryptBlobChunk(key, prefix, index, total, ct) {
+  const aad = canon(['pathy-blob-v2', String(index), String(total)]);
+  return xchacha20poly1305(key, blobChunkNonce(prefix, index), aad).decrypt(ct);
+}
+
 // ---------------------------------------------------------------- messages
 
 // Message body is a JSON object (e.g. { t:'text', text:'…' }). AAD binds the

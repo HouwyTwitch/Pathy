@@ -8,6 +8,7 @@
     "start": "node server/src/index.js",
     "test:crypto": "node scripts/crypto-test.mjs",
     "smoke": "node scripts/smoke-test.mjs",
+    "test:features": "node scripts/features-test.mjs",
     "bot:echo": "node bots/echo-bot/bot.js"
   },
   "engines": {
@@ -19,6 +20,7 @@
     "@noble/hashes": "^2.0.1",
     "@noble/post-quantum": "^0.6.1",
     "express": "^4.21.2",
+    "lottie-web": "^5.13.0",
     "pg": "^8.13.1",
     "web-push": "^3.6.7",
     "ws": "^8.18.0"
