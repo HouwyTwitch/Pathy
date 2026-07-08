@@ -880,7 +880,18 @@ api.put(
     if (!Buffer.isBuffer(req.body) || req.body.length !== ptLen + AEAD_TAG) {
       throw new HttpError(400, `chunk ${idx} must be ${ptLen + AEAD_TAG} bytes`);
     }
-    await appendChunk(id, req.body);
+    try {
+      await appendChunk(id, req.body);
+    } catch (err) {
+      // Surface storage misconfiguration (typically a root-owned Docker
+      // volume mounted at BLOB_DIR) instead of a bare "internal error".
+      if (['EACCES', 'EPERM', 'EROFS'].includes(err?.code)) {
+        console.error(`blob write failed (${err.code}): ${err.message} — check BLOB_DIR ownership/permissions`);
+        throw new HttpError(500, 'attachment storage is not writable on the server — the admin must fix BLOB_DIR permissions');
+      }
+      if (err?.code === 'ENOSPC') throw new HttpError(507, 'the server is out of disk space');
+      throw err;
+    }
     const upd = await q(
       'UPDATE blobs SET received = received + 1, ready = (received + 1 = chunks) WHERE id = $1 AND received = $2 RETURNING ready',
       [id, idx],
