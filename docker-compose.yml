@@ -37,6 +37,10 @@ services:
       # Optional: enables "import sticker pack from Telegram" (any bot token
       # from @BotFather works; it is only used to download sticker files).
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      # Optional: HTTP(S) proxy for the Telegram API — for servers in
+      # networks where api.telegram.org is blocked. Only Telegram traffic
+      # goes through it. Format: http://user:pass@host:port
+      TELEGRAM_PROXY: ${TELEGRAM_PROXY:-}
       # Set when running behind a TLS-terminating reverse proxy so client IPs
       # are taken from X-Forwarded-For (affects rate limiting only):
       # TRUST_PROXY: "1"
