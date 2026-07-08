@@ -92,6 +92,7 @@ const ICONS = {
   up: '<line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/>',
   down: '<line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/>',
   camera: '<path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/>',
+  flip: '<polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/><path d="M20.49 15a9 9 0 0 1-14.85 3.36L1 14"/>',
   more: '<circle cx="12" cy="12" r="1.4" fill="currentColor"/><circle cx="19" cy="12" r="1.4" fill="currentColor"/><circle cx="5" cy="12" r="1.4" fill="currentColor"/>',
   reply: '<polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/>',
   video: '<path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/>',
@@ -553,8 +554,17 @@ function renderMain() {
   }
 
   const chatOpen = ui.view !== 'chats' || !!ui.activeConvId;
-  app.replaceChildren(h('div', { class: `layout${chatOpen ? ' chat-open' : ''}` }, sidebar, main));
-  if (ui.modal) app.append(ui.modal);
+  const layout = h('div', { class: `layout${chatOpen ? ' chat-open' : ''}` }, sidebar, main);
+  const oldLayout = [...app.children].find((el) => el.classList?.contains('layout'));
+  if (oldLayout) oldLayout.replaceWith(layout);
+  else app.replaceChildren(layout);
+  // The modal element must stay put across re-renders: detaching and
+  // re-appending it restarts its entrance animation — the whole dialog
+  // visibly blinks every time e.g. a sticker image finishes loading.
+  for (const el of [...app.children]) {
+    if (el.classList?.contains('modal-back') && el !== ui.modal) el.remove();
+  }
+  if (ui.modal && ui.modal.parentNode !== app) app.append(ui.modal);
 
   const box = app.querySelector('.messages');
   if (box) {
@@ -1303,26 +1313,67 @@ async function openRoundRecorder(conv) {
   if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
     return toast('video recording is not supported in this browser', true);
   }
+  const camConstraints = (facingMode) => ({ facingMode, width: { ideal: 720 }, height: { ideal: 720 } });
+  let facing = 'user';
   let stream;
   try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: 'user', width: { ideal: 720 }, height: { ideal: 720 } },
-      audio: true,
-    });
+    stream = await navigator.mediaDevices.getUserMedia({ video: camConstraints(facing), audio: true });
   } catch {
     return toast('camera permission denied', true);
   }
+  const audioTrack = stream.getAudioTracks()[0] || null;
+  let camTrack = stream.getVideoTracks()[0];
+
+  // The camera feeds a hidden <video>, which is drawn onto a square canvas;
+  // the CANVAS stream is what gets recorded. That way switching front ⇄ back
+  // mid-recording never touches the recorded track set (MediaRecorder stops
+  // with an error if the recorded stream's tracks change), and the swap can
+  // hold the last frame + crossfade instead of blinking.
+  const camVideo = h('video', { playsinline: '' });
+  camVideo.muted = true;
+  camVideo.srcObject = new MediaStream([camTrack]);
+  camVideo.play().catch(() => {});
+
+  const S = 512;
+  const canvas = h('canvas', { class: 'round-canvas', width: S, height: S });
+  const ctx2d = canvas.getContext('2d');
+  let fadeStart = 0; // crossfade after a camera switch
+  let lastDraw = 0;
+  let raf = 0;
+  const draw = (now) => {
+    raf = requestAnimationFrame(draw);
+    if (now - lastDraw < 1000 / 30) return; // 30 fps is plenty for a circle
+    lastDraw = now;
+    const vw = camVideo.videoWidth;
+    const vh = camVideo.videoHeight;
+    if (!vw || !vh) return; // camera switching — hold the last frame
+    if (fadeStart) {
+      const a = Math.min(1, (now - fadeStart) / 220);
+      ctx2d.globalAlpha = a;
+      if (a === 1) fadeStart = 0;
+    }
+    const k = Math.max(S / vw, S / vh); // cover-crop the center square
+    // selfie view is mirrored (like Telegram); the rear camera is not
+    ctx2d.setTransform(facing === 'user' ? -1 : 1, 0, 0, 1, facing === 'user' ? S : 0, 0);
+    ctx2d.drawImage(camVideo, (S - vw * k) / 2, (S - vh * k) / 2, vw * k, vh * k);
+    ctx2d.setTransform(1, 0, 0, 1, 0, 0);
+    ctx2d.globalAlpha = 1;
+  };
+  raf = requestAnimationFrame(draw);
+
+  const canvasStream = canvas.captureStream(30);
+  const recStream = new MediaStream([
+    ...canvasStream.getVideoTracks(),
+    ...(audioTrack ? [audioTrack] : []),
+  ]);
   const mime = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4']
     .find((t) => MediaRecorder.isTypeSupported(t)) || '';
-  const recorder = new MediaRecorder(stream, mime
+  const recorder = new MediaRecorder(recStream, mime
     ? { mimeType: mime, videoBitsPerSecond: 1_200_000, audioBitsPerSecond: 64_000 }
     : undefined);
   const chunks = [];
   recorder.ondataavailable = (e) => { if (e.data?.size) chunks.push(e.data); };
 
-  const preview = h('video', { class: 'round-preview', autoplay: '', playsinline: '' });
-  preview.muted = true; // the attribute alone is unreliable for live streams
-  preview.srcObject = stream;
   const timer = h('span', { class: 'rec-timer' }, '0:00');
   const startTs = Date.now();
   const tick = setInterval(() => {
@@ -1332,9 +1383,47 @@ async function openRoundRecorder(conv) {
 
   const cleanup = () => {
     clearInterval(tick);
-    stream.getTracks().forEach((t) => t.stop());
+    cancelAnimationFrame(raf);
+    camTrack?.stop();
+    audioTrack?.stop();
+    canvasStream.getTracks().forEach((t) => t.stop());
     roundRec = null;
   };
+
+  // Smooth camera switch: most phones cannot open both cameras at once, so
+  // the old track stops first — the canvas freezes on its last frame — and
+  // the new camera fades in over it once it delivers frames.
+  const frame = h('div', { class: 'round-frame' }, canvas);
+  let switching = false;
+  async function flipCam() {
+    if (switching || !roundRec) return;
+    switching = true;
+    flipBtn.disabled = true;
+    frame.classList.add('flipping');
+    const want = facing === 'user' ? 'environment' : 'user';
+    camTrack?.stop();
+    for (const mode of [want, facing]) { // fall back to the old camera on failure
+      try {
+        const s = await navigator.mediaDevices.getUserMedia({ video: camConstraints(mode) });
+        camTrack = s.getVideoTracks()[0];
+        facing = mode;
+        camVideo.srcObject = new MediaStream([camTrack]);
+        await camVideo.play().catch(() => {});
+        fadeStart = performance.now();
+        break;
+      } catch { if (mode === want) toast('could not switch the camera', true); }
+    }
+    setTimeout(() => frame.classList.remove('flipping'), 500);
+    flipBtn.disabled = false;
+    switching = false;
+  }
+  const flipBtn = h('button', {
+    class: 'icon-btn', title: 'Switch camera', 'aria-label': 'Switch camera',
+    hidden: '', onclick: flipCam,
+  }, icon('flip'));
+  navigator.mediaDevices.enumerateDevices().then((devs) => {
+    if (devs.filter((d) => d.kind === 'videoinput').length > 1) flipBtn.hidden = false;
+  }).catch(() => { /* keep the button hidden */ });
   const finish = (cancel) => {
     if (!roundRec) return;
     roundRec.canceled = cancel;
@@ -1358,7 +1447,7 @@ async function openRoundRecorder(conv) {
   ui.modalClose = () => { if (roundRec) finish(true); };
   ui.modal = h('div', { class: 'modal-back round-back' },
     h('div', { class: 'round-modal' },
-      h('div', { class: 'round-frame' }, preview),
+      frame,
       h('div', { class: 'round-controls' },
         h('button', {
           class: 'icon-btn rec-cancel', title: 'Cancel', 'aria-label': 'Cancel video message',
@@ -1367,6 +1456,7 @@ async function openRoundRecorder(conv) {
         h('span', { class: 'rec-dot' }),
         timer,
         h('div', { class: 'spacer' }),
+        flipBtn,
         h('button', {
           class: 'send-btn has-text', title: 'Send', 'aria-label': 'Send video message',
           onclick: () => finish(false),
@@ -1719,22 +1809,32 @@ function tgsSticker(st, cls, ctx) {
 function stickerEl(st, cls, ctx = 'x') {
   const sid = st.sid ?? st.id;
   if ((st.mime || '') === 'application/x-tgsticker') return tgsSticker(st, cls, ctx);
+  // Placeholder and image share the sticker's own aspect ratio, so the box
+  // is reserved up front and nothing shifts when the image arrives.
+  const ratio = st.w && st.h ? `${st.w} / ${st.h}` : '1';
   const build = (url) => {
+    let el;
     if ((st.mime || '') === 'video/webm') {
-      const v = h('video', { class: cls, src: url, playsinline: '', loop: '' });
-      v.muted = true;
-      v.autoplay = true;
-      return v;
+      el = h('video', { class: cls, src: url, playsinline: '', loop: '' });
+      el.muted = true;
+      el.autoplay = true;
+    } else {
+      el = h('img', { class: cls, src: url, alt: st.emoji || 'sticker', draggable: 'false', loading: 'lazy' });
     }
-    return h('img', { class: cls, src: url, alt: st.emoji || 'sticker', draggable: 'false', loading: 'lazy' });
+    el.style.aspectRatio = ratio;
+    return el;
   };
   const ph = h('div', { class: `${cls} sticker-loading` });
+  ph.style.aspectRatio = ratio;
   // The picker's DOM is cached across re-renders (renderPicker), so a fresh
   // render would keep showing the placeholder — swap it in place instead.
   const url = cachedImage(`st:${sid}`, () => fetchStickerQueued(sid), (u) => {
     if (!ph.isConnected) return;
-    if (u) ph.replaceWith(build(u));
-    else { ph.classList.remove('sticker-loading'); ph.textContent = st.emoji || '❓'; }
+    if (u) {
+      const el = build(u);
+      el.classList.add('fade-in');
+      ph.replaceWith(el);
+    } else { ph.classList.remove('sticker-loading'); ph.textContent = st.emoji || '❓'; }
   });
   return url ? build(url) : ph;
 }
@@ -2350,9 +2450,11 @@ function renderChat() {
     const syncSend = () => {
       const has = input.value.trim().length > 0;
       sendBtn.classList.toggle('has-text', has || editingThis);
+      // mic ⇄ send swap in place (same footprint); the camera button
+      // collapses with a width transition so the input never jumps
       sendBtn.hidden = !has && !editingThis;
       micBtn.hidden = has || editingThis;
-      camBtn.hidden = has || editingThis;
+      camBtn.classList.toggle('collapsed', has || editingThis);
     };
     syncSend();
 
