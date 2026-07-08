@@ -12,8 +12,11 @@ COPY shared ./shared
 COPY server ./server
 COPY bots ./bots
 
-# writable state dir for bot containers (mounted as a volume in compose)
-RUN mkdir -p /data && chown node:node /data
+# Writable state dirs (mounted as volumes in compose). /data/blobs must exist
+# in the image with the right owner: a named volume mounted over a missing
+# path is created root-owned, and the server (running as `node`) could then
+# not store attachments.
+RUN mkdir -p /data/blobs && chown -R node:node /data
 
 USER node
 EXPOSE 8080

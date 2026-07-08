@@ -3046,31 +3046,69 @@ if ('serviceWorker' in navigator) {
   });
 }
 
-// Installed-PWA keyboard fix: when the on-screen keyboard overlays the page
-// instead of resizing it (Chrome standalone mode), shrink the app to the
-// visual viewport so the composer stays visible above the keyboard.
+// Mobile viewport plumbing for the installed app. Handles two Android
+// standalone-mode problems the CSS alone cannot:
+//  - the on-screen keyboard overlaying the page instead of resizing it
+//    (WebAPKs ignore interactive-widget=resizes-content), and
+//  - 100dvh disagreeing with the truly visible area on some versions.
+// Whenever the visual viewport diverges from the layout the shell is sized
+// and offset from visualViewport directly (--app-h / --app-y); the keyboard
+// state additionally drops the gesture-bar inset (.kb-open, see app.css).
 if (window.visualViewport) {
   const vv = window.visualViewport;
+  const root = document.documentElement;
   const sync = () => {
-    const keyboard = vv.scale === 1 && window.innerHeight - vv.height > 60;
-    if (keyboard) {
-      document.documentElement.style.setProperty('--app-h', `${Math.round(vv.height)}px`);
-      window.scrollTo(0, 0);
+    if (vv.scale > 1.01) return; // pinch zoom: never resize the shell
+    const overlayGap = window.innerHeight - vv.height; // >60 ⇒ keyboard overlays
+    const h = Math.round(vv.height);
+    const y = Math.round(vv.offsetTop);
+    const shellH = Math.round(document.body.getBoundingClientRect().height);
+    if (overlayGap > 1 || y > 0 || Math.abs(shellH - h) > 1) {
+      root.style.setProperty('--app-h', `${h}px`);
+      root.style.setProperty('--app-y', `${y}px`);
+    } else {
+      root.style.removeProperty('--app-h');
+      root.style.removeProperty('--app-y');
+    }
+    root.classList.toggle('kb-open', overlayGap > 60);
+    if (overlayGap > 60) {
       // keep the conversation pinned to the newest message under the keyboard
       const box = document.querySelector('.messages');
       if (box && box.scrollTop + box.clientHeight >= box.scrollHeight - 160) {
         requestAnimationFrame(() => { box.scrollTop = box.scrollHeight; });
       }
-    } else {
-      document.documentElement.style.removeProperty('--app-h');
     }
   };
   vv.addEventListener('resize', sync);
   vv.addEventListener('scroll', sync);
+  window.addEventListener('resize', sync);
   // some keyboards resize without firing visualViewport events right away
   window.addEventListener('focusin', () => setTimeout(sync, 300));
   window.addEventListener('focusout', () => setTimeout(sync, 300));
+  sync();
 }
+
+// Edge-to-edge Android detection: some installed-app (WebAPK) versions draw
+// the page behind the gesture navigation bar but report
+// env(safe-area-inset-bottom) as 0, leaving the composer under the gesture
+// pill. When that happens, provide a fallback inset (picked up by
+// --safe-bottom in app.css).
+function syncSafeArea() {
+  if (!/Android/i.test(navigator.userAgent)
+    || !window.matchMedia('(display-mode: standalone)').matches) return;
+  const probe = document.createElement('div');
+  probe.style.cssText = 'position:fixed;visibility:hidden;height:env(safe-area-inset-bottom,0px)';
+  document.body.append(probe);
+  const reported = probe.getBoundingClientRect().height;
+  probe.remove();
+  // Only the status bar is carved out of the window ⇒ the bottom edge is
+  // edge-to-edge; a 0 inset there means the gesture bar overlaps our UI.
+  const carved = window.screen.height - window.innerHeight;
+  const missing = reported === 0 && carved >= 0 && carved < 60;
+  document.documentElement.style.setProperty('--sab-fallback', missing ? '24px' : '0px');
+}
+syncSafeArea();
+window.addEventListener('orientationchange', () => setTimeout(syncSafeArea, 300));
 
 (async () => {
   if (!hasToken()) return render();

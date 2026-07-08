@@ -177,10 +177,26 @@ function parseTgPackName(input) {
   return name;
 }
 
+// Bot tokens look like "123456:AAAA…". Validating here turns a token pasted
+// with quotes/whitespace into a clear error instead of an Invalid URL crash.
+const TG_TOKEN_RE = /^\d+:[A-Za-z0-9_-]{20,}$/;
+
 async function tg(token, method, params) {
   const url = new URL(`https://api.telegram.org/bot${token}/${method}`);
   for (const [k, v] of Object.entries(params || {})) url.searchParams.set(k, v);
-  const res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+  let res;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+      break;
+    } catch (err) {
+      // fetch failed before an HTTP response existed: DNS, refused, timeout…
+      if (attempt < 1) continue; // one retry for transient network hiccups
+      const why = err?.cause?.code || err?.name || 'network error';
+      throw new HttpError(502,
+        `could not reach api.telegram.org (${why}) — check the server's outbound network/DNS`);
+    }
+  }
   const data = await res.json().catch(() => null);
   if (!data?.ok) {
     throw new HttpError(502, `telegram: ${data?.description || `http ${res.status}`}`);
@@ -192,9 +208,12 @@ stickers.post(
   '/import-telegram',
   rateLimit({ windowMs: 60_000, max: 4, keyFn: (req) => req.user.ref }),
   asyncRoute(async (req, res) => {
-    const token = process.env.TELEGRAM_BOT_TOKEN;
+    const token = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
     if (!token) {
       throw new HttpError(501, 'telegram import is not configured — set TELEGRAM_BOT_TOKEN on the server');
+    }
+    if (!TG_TOKEN_RE.test(token)) {
+      throw new HttpError(501, 'TELEGRAM_BOT_TOKEN looks malformed — paste the token from @BotFather as-is (digits:letters, no quotes)');
     }
     const name = parseTgPackName(req.body?.name);
     const slug = `tg:${name.toLowerCase()}`;
