@@ -90,9 +90,10 @@ assert.equal(got.length, big.length, 'size matches');
 assert.ok(got.equals(big), 'bytes match');
 log('10 MB file: chunk-encrypted upload → streamed download → bytes identical');
 
-// --- video circle: record with the fake camera and send
+// --- video circle: record with the fake camera and send (the preview is a
+// canvas fed by the camera so the lens can switch mid-recording)
 await rex.page.locator('.cam-btn').click();
-await rex.page.locator('.round-frame video').waitFor({ timeout: 15000 });
+await rex.page.locator('.round-frame .round-canvas').waitFor({ timeout: 15000 });
 await rex.page.waitForTimeout(1500);
 await rex.page.locator('.round-controls .send-btn').click();
 await rex.page.locator('.msg.out .round-wrap').waitFor({ timeout: 60000 });

@@ -4,7 +4,7 @@
 // knows (conversation id, sender ref) — never message text, which the
 // server does not have in plaintext.
 
-const VERSION = 'v5';
+const VERSION = 'v7';
 const STATIC_CACHE = `pathy-static-${VERSION}`;
 const SHELL = [
   '/',

@@ -664,6 +664,25 @@ a:hover { text-decoration: underline; }
   0%, 40% { box-shadow: 0 0 0 4px var(--accent-soft), 0 0 0 8px var(--accent-soft); }
 }
 .msg.swipe-armed .bubble { box-shadow: 0 0 0 3px var(--accent-soft); }
+/* reply arrow revealed while swiping a message (see addSwipeReply) */
+.swipe-reply-ic {
+  position: absolute;
+  left: -42px;
+  top: 50%;
+  translate: 0 -50%;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: var(--bg-raised);
+  color: var(--text-dim);
+  display: grid;
+  place-items: center;
+  opacity: 0;
+  pointer-events: none;
+  transition: background .15s ease, color .15s ease;
+}
+.msg.swipe-armed .swipe-reply-ic { background: var(--accent); color: var(--on-accent); }
+.swipe-reply-ic svg { width: 16px; height: 16px; }
 
 .msg .stamp {
   float: right;
@@ -807,11 +826,13 @@ a:hover { text-decoration: underline; }
   box-shadow: 0 0 0 3px var(--accent), var(--shadow);
   background: #000;
 }
-.round-preview {
+/* the recorder draws (pre-mirrored) camera frames onto this canvas */
+.round-canvas {
   width: 100%; height: 100%;
-  object-fit: cover;
-  transform: scaleX(-1); /* selfie mirror */
+  display: block;
 }
+.round-frame.flipping { animation: cam-flip .5s ease; }
+@keyframes cam-flip { 50% { transform: rotateY(90deg) scale(.92); } }
 .round-controls {
   display: flex;
   align-items: center;
@@ -1056,7 +1077,12 @@ a:hover { text-decoration: underline; }
   object-fit: contain;
   display: block;
 }
-.sticker-loading { background: var(--bg-hover); border-radius: 10px; width: 56px; height: 56px; }
+/* Placeholders adopt the box of the sticker class they stand in for (the
+   element carries an inline aspect-ratio from the sticker's w/h), so nothing
+   jumps when the image arrives. */
+.sticker-loading { background: var(--bg-hover); border-radius: 10px; }
+/* freshly loaded images fade in instead of popping */
+.fade-in { animation: fade-in .18s ease; }
 /* animated .tgs stickers render into a canvas inside this container */
 .tgs {
   aspect-ratio: 1;
@@ -1081,6 +1107,21 @@ a:hover { text-decoration: underline; }
 .sticker-cell.edit .sticker-del svg { width: 12px; height: 12px; }
 .active-ic { color: var(--accent-hover); }
 .mic-btn svg, .cam-btn svg { width: 23px; height: 23px; }
+/* the camera button folds away smoothly while typing (see syncSend) */
+.composer .cam-btn {
+  width: 43px;
+  padding-left: 10px;
+  padding-right: 10px;
+  overflow: hidden;
+  transition: width .15s ease, padding .15s ease, opacity .15s ease;
+}
+.composer .cam-btn.collapsed {
+  width: 0;
+  padding-left: 0;
+  padding-right: 0;
+  opacity: 0;
+  pointer-events: none;
+}
 
 .composer {
   display: flex;
@@ -1359,6 +1400,9 @@ a:hover { text-decoration: underline; }
 *::-webkit-scrollbar { width: 8px; height: 8px; }
 *::-webkit-scrollbar-thumb { background: var(--border); border-radius: 999px; }
 *::-webkit-scrollbar-track { background: transparent; }
+/* reserve the scrollbar lane up front so content doesn't shift sideways the
+   moment a list grows enough to scroll */
+.messages, .chat-list, .picker-body, .view { scrollbar-gutter: stable; }
 
 /* ---------- mobile ---------- */
 
