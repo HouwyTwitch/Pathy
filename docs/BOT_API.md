@@ -37,8 +37,8 @@ All bot endpoints live under `/botapi/<token>/…`. No headers needed.
 | `GET /conversations/:id/messages?beforeId=&limit=` | ciphertext history |
 | `GET /bundles/:ref` | public bundle of `u:<name>` / `b:<name>` (for verifying senders / wrapping) |
 | `POST /sendMessage` | `{ convId, keyVersion, n, ct, sig }` — pre-encrypted by the SDK |
-| `POST /conversations/:id/blobs` | upload an encrypted attachment (raw `application/octet-stream` body, ≤ 64 MB) → `{ blobId }` |
-| `GET /blobs/:id` | download an encrypted attachment from a conversation the bot belongs to |
+| `POST /conversations/:id/blobs` | upload an encrypted attachment (raw `application/octet-stream` body, ≤ 64 MB single-shot) → `{ blobId }` |
+| `GET /blobs/:id` | download an encrypted attachment from a conversation the bot belongs to (streams; web clients may upload chunk-encrypted files up to 2 GB) |
 
 ### Message body types
 
@@ -46,9 +46,11 @@ The decrypted message body is JSON:
 
 | body | Meaning |
 |---|---|
-| `{ t: "text", text }` | plain text (clients render http(s) links) |
-| `{ t: "sticker", emoji }` | a sticker — clients render the emoji large |
-| `{ t: "file", name, size, mime, blobId, k, n, … }` | attachment: `blobId` points at an uploaded encrypted blob; `k`/`n` are the file key + nonce (base64url) for `decryptBlob` in [`shared/crypto.js`](../shared/crypto.js). The blob itself is XChaCha20-Poly1305 ciphertext — fetch it via `GET /blobs/:id` and decrypt locally. Extra fields: `w`/`h` (image dimensions), `kind: "voice"` + `dur` seconds (voice notes). |
+| `{ t: "text", text, replyTo? }` | plain text (clients render http(s) links). `replyTo: { id, sender, kind, preview }` marks a Telegram-style reply to message `id`. |
+| `{ t: "sticker", emoji }` | a legacy emoji sticker — clients render the emoji large |
+| `{ t: "sticker", sid, pack, emoji, w, h, mime }` | a pack sticker: image lives server-side, users fetch it via `GET /api/stickers/sticker/:sid/image` |
+| `{ t: "file", name, size, mime, blobId, k, n, … }` | v1 attachment: `blobId` points at an uploaded encrypted blob; `k`/`n` are the file key + nonce (base64url) for `decryptBlob` in [`shared/crypto.js`](../shared/crypto.js). The blob itself is XChaCha20-Poly1305 ciphertext — fetch it via `GET /blobs/:id` and decrypt locally. Extra fields: `w`/`h` (media dimensions), `kind: "voice"` + `dur` seconds (voice notes), `kind: "round"` + `dur` (round video messages). |
+| `{ t: "file", …, np, cs }` | v2 attachment (sent by web clients, up to 2 GB): the blob is a sequence of chunks of `cs` plaintext bytes (+16-byte AEAD tag each); decrypt chunk `i` of `ceil(size/cs)` with `decryptBlobChunk(k, np, i, total, ct)` from `shared/crypto.js`. |
 
 ### Update types
 

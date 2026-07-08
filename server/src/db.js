@@ -109,9 +109,52 @@ CREATE TABLE IF NOT EXISTS reads (
   PRIMARY KEY (conv_id, ref)
 );
 
+-- Sticker packs. Sticker images are profile-grade data (like avatars), not
+-- E2E content: any logged-in user who receives a sticker can fetch it and
+-- install the pack. Messages referencing stickers stay E2E-encrypted.
+CREATE TABLE IF NOT EXISTS sticker_packs (
+  id         SERIAL PRIMARY KEY,
+  slug       TEXT NOT NULL UNIQUE,
+  title      TEXT NOT NULL,
+  owner_id   INT REFERENCES users(id) ON DELETE SET NULL,
+  origin     TEXT NOT NULL DEFAULT 'custom' CHECK (origin IN ('custom','telegram')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS stickers (
+  id         SERIAL PRIMARY KEY,
+  pack_id    INT NOT NULL REFERENCES sticker_packs(id) ON DELETE CASCADE,
+  pos        INT NOT NULL DEFAULT 0,
+  emoji      TEXT,
+  mime       TEXT NOT NULL,
+  w          INT,
+  h          INT,
+  data       BYTEA NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS stickers_pack_idx ON stickers(pack_id, pos, id);
+
+-- Which packs a user has installed (owner is auto-installed on create).
+CREATE TABLE IF NOT EXISTS user_sticker_packs (
+  user_id  INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  pack_id  INT NOT NULL REFERENCES sticker_packs(id) ON DELETE CASCADE,
+  pos      INT NOT NULL DEFAULT 0,
+  added_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, pack_id)
+);
+
 -- Idempotent migrations for columns added after the initial schema.
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at  TIMESTAMPTZ;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+-- Large attachments (up to 2 GB) live on disk, not in BYTEA rows; the row
+-- keeps metadata + upload progress. Legacy rows keep their inline data.
+ALTER TABLE blobs ALTER COLUMN data DROP NOT NULL;
+ALTER TABLE blobs ALTER COLUMN size TYPE BIGINT;
+ALTER TABLE blobs ADD COLUMN IF NOT EXISTS store       TEXT NOT NULL DEFAULT 'db';
+ALTER TABLE blobs ADD COLUMN IF NOT EXISTS chunks      INT NOT NULL DEFAULT 1;
+ALTER TABLE blobs ADD COLUMN IF NOT EXISTS chunk_bytes INT;
+ALTER TABLE blobs ADD COLUMN IF NOT EXISTS received    INT NOT NULL DEFAULT 1;
+ALTER TABLE blobs ADD COLUMN IF NOT EXISTS ready       BOOLEAN NOT NULL DEFAULT true;
 -- Profile avatars (public to logged-in users, like usernames).
 ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar      BYTEA;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_mime TEXT;

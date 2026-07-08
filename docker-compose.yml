@@ -31,11 +31,19 @@ services:
     environment:
       DATABASE_URL: postgres://pathy:${POSTGRES_PASSWORD}@db:5432/pathy
       PORT: "8080"
+      # Large encrypted attachments (up to 2 GB) are stored on disk, not in
+      # Postgres — keep this on a volume.
+      BLOB_DIR: /data/blobs
+      # Optional: enables "import sticker pack from Telegram" (any bot token
+      # from @BotFather works; it is only used to download sticker files).
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       # Set when running behind a TLS-terminating reverse proxy so client IPs
       # are taken from X-Forwarded-For (affects rate limiting only):
       # TRUST_PROXY: "1"
     ports:
       - "${PATHY_PORT:-8080}:8080"
+    volumes:
+      - pathy-blobs:/data/blobs
     depends_on:
       db:
         condition: service_healthy
@@ -59,4 +67,5 @@ services:
 
 volumes:
   pathy-db:
+  pathy-blobs:
   bot-state:
