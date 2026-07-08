@@ -664,6 +664,25 @@ a:hover { text-decoration: underline; }
   0%, 40% { box-shadow: 0 0 0 4px var(--accent-soft), 0 0 0 8px var(--accent-soft); }
 }
 .msg.swipe-armed .bubble { box-shadow: 0 0 0 3px var(--accent-soft); }
+/* reply arrow revealed while swiping a message (see addSwipeReply) */
+.swipe-reply-ic {
+  position: absolute;
+  left: -42px;
+  top: 50%;
+  translate: 0 -50%;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: var(--bg-raised);
+  color: var(--text-dim);
+  display: grid;
+  place-items: center;
+  opacity: 0;
+  pointer-events: none;
+  transition: background .15s ease, color .15s ease;
+}
+.msg.swipe-armed .swipe-reply-ic { background: var(--accent); color: var(--on-accent); }
+.swipe-reply-ic svg { width: 16px; height: 16px; }
 
 .msg .stamp {
   float: right;

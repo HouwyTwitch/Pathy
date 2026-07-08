@@ -23,6 +23,7 @@ const ui = {
   searchQuery: '',
   searchResults: null,
   modal: null,
+  modalClose: null,       // optional cleanup when the modal is closed externally (Esc/Back)
 };
 
 let stickerPacks = null;   // installed packs (null until first load)
@@ -570,6 +571,7 @@ function renderMain() {
   }
   const unreadTotal = [...ui.unread.values()].reduce((a, b) => a + b, 0);
   document.title = unreadTotal > 0 ? `(${unreadTotal}) Pathy` : 'Pathy';
+  syncBackStack();
 }
 
 // Re-render just the sidebar list (used while typing in search, so the
@@ -1252,10 +1254,13 @@ function replyQuote(rt) {
   h('div', { class: 'rq-text' }, rt.preview || 'Message'));
 }
 
-// Swipe right on a message to reply (touch devices, like Telegram).
+// Swipe right on a message to reply (touch devices, like Telegram): the
+// message follows the finger and a reply arrow fades in; past the threshold
+// the arrow lights up and releasing starts the reply.
 function addSwipeReply(el, fn) {
   let start = null;
   let dx = 0;
+  let arrow = null;
   el.addEventListener('touchstart', (e) => {
     if (ui.select || e.touches.length !== 1) return;
     start = { x: e.touches[0].clientX, y: e.touches[0].clientY, swiping: false };
@@ -1268,9 +1273,11 @@ function addSwipeReply(el, fn) {
     if (!start.swiping) {
       if (Math.abs(my) > 14 || Math.abs(mx) < 12) { if (Math.abs(my) > 14) start = null; return; }
       start.swiping = true;
+      if (!arrow) { arrow = h('span', { class: 'swipe-reply-ic' }, icon('reply')); el.append(arrow); }
     }
     dx = Math.max(0, Math.min(72, mx));
     el.style.transform = `translateX(${dx}px)`;
+    if (arrow) arrow.style.opacity = String(Math.min(1, dx / 48));
     el.classList.toggle('swipe-armed', dx >= 48);
   }, { passive: true });
   const end = () => {
@@ -1279,6 +1286,8 @@ function addSwipeReply(el, fn) {
     start = null;
     el.style.transform = '';
     el.classList.remove('swipe-armed');
+    arrow?.remove();
+    arrow = null;
     if (fire) fn();
   };
   el.addEventListener('touchend', end);
@@ -1345,6 +1354,8 @@ async function openRoundRecorder(conv) {
   };
   roundRec = { canceled: false };
   recorder.start(250);
+  // closing the modal externally (Esc / phone Back) cancels the recording
+  ui.modalClose = () => { if (roundRec) finish(true); };
   ui.modal = h('div', { class: 'modal-back round-back' },
     h('div', { class: 'round-modal' },
       h('div', { class: 'round-frame' }, preview),
@@ -2314,14 +2325,17 @@ function renderChat() {
       renderMain();
     };
     input.addEventListener('keydown', (e) => {
-      // Enter sends; Shift+Enter makes a newline (like Telegram Web)
+      // Enter sends; Shift+Enter makes a newline (like Telegram Web).
+      // Escape is handled by the global back-navigation handler.
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         send();
-      } else if (e.key === 'Escape') {
-        if (editingThis) cancelEdit(conv);
-        else if (replyingThis) { ui.replying = null; renderMain(); }
-        else if (ui.picker) { ui.picker = null; renderMain(); }
+      } else if (e.key === 'ArrowUp' && !input.value.trim() && !editingThis) {
+        // ↑ in an empty composer edits your last text message (like Telegram)
+        const mine = (ui.msgs.get(conv.id) || [])
+          .filter((x) => x.senderRef === state.me.ref && x.id != null && !x.pending && x.body?.t === 'text')
+          .at(-1);
+        if (mine) { e.preventDefault(); startEdit(conv, mine); }
       }
     });
     const sendBtn = h('button', { class: 'send-btn', title: 'Send', 'aria-label': 'Send', onclick: send }, icon('send'));
@@ -2387,9 +2401,103 @@ function renderChat() {
 // ---- modals
 
 function closeModal() {
+  const onClose = ui.modalClose;
   ui.modal = null;
+  ui.modalClose = null;
+  if (onClose) onClose(); // e.g. stop a live recording behind the modal
   renderMain();
 }
+
+// ---- back navigation
+// One "back" model shared by the Esc key, the browser/phone Back button and
+// the UI close buttons. Closable layers (modal → recording → selection →
+// picker → panel view → open chat on single-pane phones) are mirrored into
+// the history stack, so Android's back gesture peels them off one by one
+// instead of leaving the app.
+
+const isPhone = () => window.matchMedia('(max-width: 768px)').matches;
+
+function closableCount() {
+  if (!state.me) return 0;
+  return (ui.modal ? 1 : 0)
+    + (rec && !rec.canceled ? 1 : 0)
+    + (ui.select ? 1 : 0)
+    + (ui.picker ? 1 : 0)
+    + (ui.view !== 'chats' ? 1 : 0)
+    + (isPhone() && ui.view === 'chats' && ui.activeConvId != null ? 1 : 0);
+}
+
+// Close the top-most layer; returns false when there was nothing to close.
+// The open chat also closes on desktop (Esc), it just isn't a history layer.
+function back() {
+  if (ui.modal) { closeModal(); return true; }
+  if (rec && !rec.canceled) { stopRecording(true); return true; }
+  if (ui.select) { ui.select = null; renderMain(); return true; }
+  if (ui.picker) { ui.picker = null; renderMain(); return true; }
+  if (ui.view !== 'chats') { ui.view = 'chats'; renderMain(); return true; }
+  if (ui.activeConvId != null) { ui.activeConvId = null; renderMain(); return true; }
+  return false;
+}
+
+let backDepth = 0;      // sentinel history entries we own
+let pendingPop = 0;     // in-flight history.go() traversals we initiated
+let syncQueued = false;
+let navigatingBack = false;
+
+// Reconcile history with the UI. Deferred to a microtask so that
+// close-then-open within one click handler (e.g. an action sheet turning
+// into selection mode) reconciles once against the FINAL state — pushState
+// is synchronous but history.go() is a queued traversal, and interleaving
+// them mid-transition corrupts the accounting (it once walked the page back
+// to about:blank). While one of our traversals is in flight, reconciliation
+// waits; the popstate handler re-arms it.
+function syncBackStack() {
+  if (syncQueued) return;
+  syncQueued = true;
+  queueMicrotask(() => {
+    syncQueued = false;
+    if (navigatingBack || pendingPop > 0 || !state.me) return;
+    const want = closableCount();
+    while (backDepth < want) history.pushState({ pathy: ++backDepth }, '');
+    if (want < backDepth) {
+      pendingPop++;
+      history.go(want - backDepth);
+      backDepth = want;
+    }
+  });
+}
+
+window.addEventListener('popstate', (e) => {
+  if (pendingPop > 0) { pendingPop--; syncBackStack(); return; } // our own traversal landed
+  const depth = Number(e.state?.pathy) || 0;
+  if (depth >= backDepth) { backDepth = depth; return; } // forward navigation — nothing to close
+  backDepth = depth;
+  navigatingBack = true;
+  try {
+    for (let i = 0; i < 8 && closableCount() > depth; i++) if (!back()) break;
+  } finally {
+    navigatingBack = false;
+  }
+  syncBackStack();
+});
+
+// Collapse sentinel entries left over from a previous page load.
+if (Number(history.state?.pathy) > 0) {
+  pendingPop++;
+  history.go(-Number(history.state.pathy));
+}
+
+window.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape' || !state.me) return;
+  // panels first (like Telegram), then edit/reply drafts, then chat/view
+  if (ui.modal || (rec && !rec.canceled) || ui.select || ui.picker) { back(); return; }
+  if (ui.editing) {
+    const conv = findConv(ui.editing.convId);
+    if (conv) { cancelEdit(conv); return; }
+  }
+  if (ui.replying) { ui.replying = null; renderMain(); return; }
+  back();
+});
 
 function modal(title, ...content) {
   return h('div', { class: 'modal-back', onclick: (e) => { if (e.target.classList.contains('modal-back')) closeModal(); } },
