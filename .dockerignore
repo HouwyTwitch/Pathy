@@ -1,6 +1,7 @@
 .git
 node_modules
 scripts
+!scripts/tg-check.mjs
 docs
 *.md
 .env
