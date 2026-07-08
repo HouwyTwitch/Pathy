@@ -235,16 +235,37 @@ async function syncPushSubscription(enable) {
 
 const avatarCache = new Map(); // cache key -> { url } | { loading } | { missing }
 
-function cachedImage(key, fetcher) {
+// Coalesce re-renders: opening a big sticker pack finishes dozens of image
+// fetches in a burst — one renderMain per frame, not one per image.
+let renderQueued = false;
+function queueRender() {
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(() => { renderQueued = false; renderMain(); });
+}
+
+// `onload` (optional) fires with the object URL (or null on failure) once the
+// image arrives — for callers whose DOM renderMain does not rebuild (the
+// cached picker, open modals) so they can patch themselves in place.
+function cachedImage(key, fetcher, onload) {
   let e = avatarCache.get(key);
   if (!e) {
-    e = { loading: true };
+    e = { loading: true, waiters: [] };
     avatarCache.set(key, e);
     fetcher().then((blob) => {
       e.url = URL.createObjectURL(blob);
       e.loading = false;
-      renderMain();
-    }).catch(() => { e.missing = true; e.loading = false; });
+      for (const fn of e.waiters.splice(0)) fn(e.url);
+      queueRender();
+    }).catch(() => {
+      e.missing = true;
+      e.loading = false;
+      for (const fn of e.waiters.splice(0)) fn(null);
+    });
+  }
+  if (onload) {
+    if (e.loading) e.waiters.push(onload);
+    else if (e.missing) onload(null);
   }
   return e.url || null;
 }
@@ -1597,11 +1618,28 @@ async function gunzip(bytes) {
   return new Response(stream).arrayBuffer();
 }
 
+// Sticker images download through a small queue: opening a 100-sticker pack
+// must not slam the server with one request per sticker at once.
+const stickerFetchQueue = [];
+let stickerFetchActive = 0;
+function fetchStickerQueued(sid) {
+  return new Promise((resolve, reject) => {
+    stickerFetchQueue.push(() => api.fetchSticker(sid).then(resolve, reject));
+    pumpStickerFetches();
+  });
+}
+function pumpStickerFetches() {
+  while (stickerFetchActive < 6 && stickerFetchQueue.length) {
+    stickerFetchActive++;
+    stickerFetchQueue.shift()().finally(() => { stickerFetchActive--; pumpStickerFetches(); });
+  }
+}
+
 const tgsDataCache = new Map(); // sid -> Promise<lottie animation JSON>
 function tgsData(sid) {
   let p = tgsDataCache.get(sid);
   if (!p) {
-    p = api.fetchSticker(sid)
+    p = fetchStickerQueued(sid)
       .then(async (blob) => JSON.parse(new TextDecoder().decode(await gunzip(await blob.arrayBuffer()))));
     tgsDataCache.set(sid, p);
     p.catch(() => tgsDataCache.delete(sid));
@@ -1670,15 +1708,24 @@ function tgsSticker(st, cls, ctx) {
 function stickerEl(st, cls, ctx = 'x') {
   const sid = st.sid ?? st.id;
   if ((st.mime || '') === 'application/x-tgsticker') return tgsSticker(st, cls, ctx);
-  const url = cachedImage(`st:${sid}`, () => api.fetchSticker(sid));
-  if (!url) return h('div', { class: `${cls} sticker-loading` });
-  if ((st.mime || '') === 'video/webm') {
-    const v = h('video', { class: cls, src: url, playsinline: '', loop: '' });
-    v.muted = true;
-    v.autoplay = true;
-    return v;
-  }
-  return h('img', { class: cls, src: url, alt: st.emoji || 'sticker', draggable: 'false', loading: 'lazy' });
+  const build = (url) => {
+    if ((st.mime || '') === 'video/webm') {
+      const v = h('video', { class: cls, src: url, playsinline: '', loop: '' });
+      v.muted = true;
+      v.autoplay = true;
+      return v;
+    }
+    return h('img', { class: cls, src: url, alt: st.emoji || 'sticker', draggable: 'false', loading: 'lazy' });
+  };
+  const ph = h('div', { class: `${cls} sticker-loading` });
+  // The picker's DOM is cached across re-renders (renderPicker), so a fresh
+  // render would keep showing the placeholder — swap it in place instead.
+  const url = cachedImage(`st:${sid}`, () => fetchStickerQueued(sid), (u) => {
+    if (!ph.isConnected) return;
+    if (u) ph.replaceWith(build(u));
+    else { ph.classList.remove('sticker-loading'); ph.textContent = st.emoji || '❓'; }
+  });
+  return url ? build(url) : ph;
 }
 
 // Downscale an image to sticker size (≤512px) and encode as WEBP (browsers
