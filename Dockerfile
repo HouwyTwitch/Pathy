@@ -11,6 +11,9 @@ RUN npm ci --omit=dev --no-audit --no-fund
 COPY shared ./shared
 COPY server ./server
 COPY bots ./bots
+# diagnostics usable inside the container (the rest of scripts/ is
+# dev/test-only and stays dockerignored)
+COPY scripts/tg-check.mjs ./scripts/
 
 # Writable state dirs (mounted as volumes in compose). /data/blobs must exist
 # in the image with the right owner: a named volume mounted over a missing

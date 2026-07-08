@@ -5,6 +5,7 @@
 // reference stickers remain end-to-end encrypted.
 import { Router, raw } from 'express';
 import { randomUUID } from 'node:crypto';
+import { fetch as proxiedFetch, ProxyAgent } from 'undici';
 import { q, pool } from '../db.js';
 import { HttpError, asyncRoute } from '../util.js';
 import { rateLimit } from '../ratelimit.js';
@@ -181,22 +182,52 @@ function parseTgPackName(input) {
 // with quotes/whitespace into a clear error instead of an Invalid URL crash.
 const TG_TOKEN_RE = /^\d+:[A-Za-z0-9_-]{20,}$/;
 
-async function tg(token, method, params) {
-  const url = new URL(`https://api.telegram.org/bot${token}/${method}`);
-  for (const [k, v] of Object.entries(params || {})) url.searchParams.set(k, v);
-  let res;
+// Optional TELEGRAM_PROXY (http://user:pass@host:port) routes all Telegram
+// API traffic through an HTTP(S) proxy — for servers in networks where
+// api.telegram.org is blocked. Credentials in the URL become proxy Basic
+// auth; the proxy only ever sees Telegram's public sticker files.
+let proxyCache = null; // { url, agent }
+function tgProxyAgent() {
+  const url = String(process.env.TELEGRAM_PROXY || '').trim();
+  if (!url) return null;
+  if (proxyCache?.url !== url) {
+    if (!/^https?:\/\//i.test(url)) {
+      throw new HttpError(501, 'TELEGRAM_PROXY must be an http(s) proxy URL like http://user:pass@host:port');
+    }
+    try {
+      proxyCache = { url, agent: new ProxyAgent(url) };
+    } catch {
+      throw new HttpError(501, 'TELEGRAM_PROXY is not a valid proxy URL — use http://user:pass@host:port');
+    }
+  }
+  return proxyCache.agent;
+}
+
+// fetch() with the Telegram proxy applied and network failures mapped to a
+// clear, actionable 502 (one retry for transient hiccups first).
+async function tgFetch(url, { timeoutMs }) {
+  const dispatcher = tgProxyAgent();
   for (let attempt = 0; ; attempt++) {
     try {
-      res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
-      break;
+      const signal = AbortSignal.timeout(timeoutMs);
+      return dispatcher
+        ? await proxiedFetch(url, { signal, dispatcher })
+        : await fetch(url, { signal });
     } catch (err) {
       // fetch failed before an HTTP response existed: DNS, refused, timeout…
       if (attempt < 1) continue; // one retry for transient network hiccups
-      const why = err?.cause?.code || err?.name || 'network error';
-      throw new HttpError(502,
-        `could not reach api.telegram.org (${why}) — check the server's outbound network/DNS`);
+      const why = err?.cause?.code || err?.cause?.message || err?.name || 'network error';
+      throw new HttpError(502, dispatcher
+        ? `could not reach api.telegram.org via TELEGRAM_PROXY (${why}) — check the proxy address, credentials and reachability`
+        : `could not reach api.telegram.org (${why}) — if Telegram is blocked in your network, set TELEGRAM_PROXY (http://user:pass@host:port) on the server`);
     }
   }
+}
+
+async function tg(token, method, params) {
+  const url = new URL(`https://api.telegram.org/bot${token}/${method}`);
+  for (const [k, v] of Object.entries(params || {})) url.searchParams.set(k, v);
+  const res = await tgFetch(url, { timeoutMs: 15_000 });
   const data = await res.json().catch(() => null);
   if (!data?.ok) {
     throw new HttpError(502, `telegram: ${data?.description || `http ${res.status}`}`);
@@ -248,9 +279,9 @@ stickers.post(
         try {
           const f = await tg(token, 'getFile', { file_id: s.file_id });
           if (!f.file_path || (f.file_size || 0) > MAX_STICKER_BYTES) continue;
-          const dl = await fetch(
+          const dl = await tgFetch(
             `https://api.telegram.org/file/bot${token}/${f.file_path}`,
-            { signal: AbortSignal.timeout(20_000) },
+            { timeoutMs: 20_000 },
           );
           if (!dl.ok) continue;
           const buf = Buffer.from(await dl.arrayBuffer());

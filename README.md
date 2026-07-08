@@ -78,7 +78,15 @@ docker compose --profile bots up -d --build
 
 To enable **importing sticker packs from Telegram**, set `TELEGRAM_BOT_TOKEN`
 in `.env` to any bot token from [@BotFather](https://t.me/BotFather) — it is
-used only to download sticker files from Telegram's servers.
+used only to download sticker files from Telegram's servers. If your server
+sits in a network where `api.telegram.org` is blocked, also set
+`TELEGRAM_PROXY=http://user:pass@host:port` — an HTTP(S) proxy used for
+Telegram API traffic only. To diagnose import problems, run the checker
+with the same environment the server uses:
+
+```bash
+docker compose exec server node scripts/tg-check.mjs t.me/addstickers/SomePack
+```
 
 Large attachments are stored (as ciphertext) under `BLOB_DIR`
 (`/data/blobs` in Docker, `data/blobs` in the repo otherwise).
